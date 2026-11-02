@@ -16,13 +16,21 @@
 #define FLASH_SIZE_2MB   0x200000  // 2,097,152 Bytes
 
 uint32_t currentSpiFreqHz = 10000000;
+String serialRxBuf = "";
 
+// Non-blocking STOP Command Check
 bool checkStopCommand() {
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
-    input.trim();
-    if (input == "STOP") {
-      return true;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      serialRxBuf.trim();
+      if (serialRxBuf == "STOP") {
+        serialRxBuf = "";
+        return true;
+      }
+      serialRxBuf = "";
+    } else {
+      serialRxBuf += c;
     }
   }
   return false;
@@ -42,6 +50,7 @@ void waitBusyWithProgress() {
     status = SPI.transfer(0x00);
     digitalWrite(CS_PIN, HIGH);
     SPI.endTransaction();
+    
     delay(5);
     step++;
     if (step % 2 == 0 && step <= 18) {
@@ -67,7 +76,7 @@ uint8_t getPatternByte(uint32_t offset, int patternType, uint8_t customVal = 0x0
     case 2: return (offset % 2 == 0) ? 0xAA : 0x55;
     case 3: return (uint8_t)(offset & 0xFF);
     case 4: return 0x00;
-    case 5: { // Pseudo-Random
+    case 5: { // Pseudo-Random PRNG
       uint32_t hash = offset ^ 0x5BF03635;
       hash = (hash ^ (hash >> 16)) * 0x45d9f3b;
       hash = (hash ^ (hash >> 16)) * 0x45d9f3b;
@@ -221,6 +230,41 @@ bool eraseSector(uint32_t addr) {
   return true;
 }
 
+void runLoopTest(int scope, uint32_t addr, uint32_t len, int patType, uint8_t customVal) {
+  uint32_t cycle = 1;
+  while (true) {
+    if (checkStopCommand()) { Serial.println("ABORTED"); break; }
+    Serial.printf("CYCLE_START:%u\n", cycle);
+
+    Serial.println("PHASE:ERASE");
+    if (scope == 1) {
+      if (!eraseChip()) break;
+    } else {
+      if (!eraseSector(addr)) break;
+    }
+    if (checkStopCommand()) { Serial.println("ABORTED"); break; }
+
+    Serial.println("PHASE:WRITE");
+    if (scope == 1) {
+      if (!writePattern(0x000000, FLASH_SIZE_2MB, patType, customVal)) break;
+    } else {
+      if (!writePattern(addr, len, patType, customVal)) break;
+    }
+    if (checkStopCommand()) { Serial.println("ABORTED"); break; }
+
+    Serial.println("PHASE:VERIFY");
+    uint32_t errs = 0;
+    if (scope == 1) {
+      if (!verifyPattern(0x000000, FLASH_SIZE_2MB, patType, customVal, errs)) break;
+    } else {
+      if (!verifyPattern(addr, len, patType, customVal, errs)) break;
+    }
+
+    Serial.printf("CYCLE_DONE:%u:%u\n", cycle, errs);
+    cycle++;
+  }
+}
+
 void runAllPatternSweep(bool isLoop) {
   uint32_t cycle = 1;
   do {
@@ -229,18 +273,14 @@ void runAllPatternSweep(bool isLoop) {
 
     for (int pat = 0; pat <= 5; pat++) {
       if (checkStopCommand()) { Serial.println("ABORTED"); return; }
-      
       Serial.printf("PAT_START:%d\n", pat);
 
-      // 1. Erase
       Serial.println("PHASE:ERASE");
       if (!eraseChip()) return;
 
-      // 2. Write
       Serial.println("PHASE:WRITE");
       if (!writePattern(0x000000, FLASH_SIZE_2MB, pat, 0x00)) return;
 
-      // 3. Verify
       Serial.println("PHASE:VERIFY");
       uint32_t errs = 0;
       if (!verifyPattern(0x000000, FLASH_SIZE_2MB, pat, 0x00, errs)) return;
@@ -253,11 +293,40 @@ void runAllPatternSweep(bool isLoop) {
   } while (isLoop);
 }
 
+// Helpers for safe command tokenizing
+uint32_t parseHex(String str) {
+  str.trim();
+  if (str.startsWith("0x") || str.startsWith("0X")) {
+    str = str.substring(2);
+  }
+  return strtoul(str.c_str(), NULL, 16);
+}
+
+int splitString(String src, char delim, String tokens[], int maxTokens) {
+  int count = 0;
+  int start = 0;
+  int len = src.length();
+  for (int i = 0; i <= len; i++) {
+    if (i == len || src.charAt(i) == delim) {
+      if (count < maxTokens) {
+        tokens[count++] = src.substring(start, i);
+      }
+      start = i + 1;
+    }
+  }
+  return count;
+}
+
 void processCommand(String cmd) {
   cmd.trim();
+  if (cmd.length() == 0) return;
 
-  if (cmd.startsWith("SET_FREQ:")) {
-    int mhz = cmd.substring(9).toInt();
+  String tokens[8];
+  int count = splitString(cmd, ':', tokens, 8);
+  String action = tokens[0];
+
+  if (action == "SET_FREQ" && count >= 2) {
+    int mhz = tokens[1].toInt();
     if (mhz > 0 && mhz <= 80) {
       currentSpiFreqHz = mhz * 1000000;
       Serial.printf("FREQ:OK:%d\n", mhz);
@@ -265,7 +334,7 @@ void processCommand(String cmd) {
       Serial.println("FREQ:ERR");
     }
   }
-  else if (cmd == "READ_ID") {
+  else if (action == "READ_ID") {
     Serial.println("PROGRESS:0");
     SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
     digitalWrite(CS_PIN, LOW);
@@ -278,7 +347,7 @@ void processCommand(String cmd) {
     Serial.println("PROGRESS:100");
     Serial.printf("ID:%02X %02X %02X\n", mfg, type, id);
   }
-  else if (cmd == "UNLOCK") {
+  else if (action == "UNLOCK") {
     Serial.println("PROGRESS:0");
     writeEnable();
     SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
@@ -290,7 +359,7 @@ void processCommand(String cmd) {
     Serial.println("PROGRESS:100");
     Serial.println("UNLOCK:OK");
   }
-  else if (cmd == "READ_REGS") {
+  else if (action == "READ_REGS") {
     Serial.println("PROGRESS:0");
     SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
     digitalWrite(CS_PIN, LOW);
@@ -309,61 +378,56 @@ void processCommand(String cmd) {
     Serial.println("PROGRESS:100");
     Serial.printf("REGS:%02X:%02X\n", stat, cfg);
   }
-  else if (cmd.startsWith("ERASE:")) {
-    uint32_t addr = strtoul(cmd.substring(6).c_str(), NULL, 16);
+  else if (action == "ERASE" && count >= 2) {
+    uint32_t addr = parseHex(tokens[1]);
     eraseSector(addr);
     Serial.println("ERASE:OK");
   }
-  else if (cmd == "ERASE_CHIP") {
+  else if (action == "ERASE_CHIP") {
     eraseChip();
     Serial.println("ERASE_CHIP:OK");
   }
-  else if (cmd.startsWith("ALL_PAT_START:")) {
-    bool isLoop = (cmd.substring(14).toInt() == 1);
-    runAllPatternSweep(isLoop);
-  }
-  else if (cmd.startsWith("WRITE_PAT:")) {
-    int p1 = cmd.indexOf(':', 10);
-    int p2 = cmd.indexOf(':', p1 + 1);
-    int p3 = cmd.indexOf(':', p2 + 1);
-    uint32_t addr = strtoul(cmd.substring(10, p1).c_str(), NULL, 16);
-    uint32_t len = cmd.substring(p1 + 1, p2).toInt();
-    int patType = cmd.substring(p2 + 1, p3).toInt();
-    uint8_t customVal = (uint8_t)strtoul(cmd.substring(p3 + 1).c_str(), NULL, 16);
-
+  else if (action == "WRITE_PAT" && count >= 5) {
+    uint32_t addr = parseHex(tokens[1]);
+    uint32_t len = tokens[2].toInt();
+    int patType = tokens[3].toInt();
+    uint8_t customVal = (uint8_t)parseHex(tokens[4]);
     writePattern(addr, len, patType, customVal);
   }
-  else if (cmd.startsWith("WRITE_FULL_PAT:")) {
-    int p1 = cmd.indexOf(':', 15);
-    int patType = cmd.substring(15, p1).toInt();
-    uint8_t customVal = (uint8_t)strtoul(cmd.substring(p1 + 1).c_str(), NULL, 16);
-
+  else if (action == "WRITE_FULL_PAT" && count >= 3) {
+    int patType = tokens[1].toInt();
+    uint8_t customVal = (uint8_t)parseHex(tokens[2]);
     writePattern(0x000000, FLASH_SIZE_2MB, patType, customVal);
   }
-  else if (cmd.startsWith("VERIFY:")) {
-    int p1 = cmd.indexOf(':', 7);
-    int p2 = cmd.indexOf(':', p1 + 1);
-    int p3 = cmd.indexOf(':', p2 + 1);
-    uint32_t addr = strtoul(cmd.substring(7, p1).c_str(), NULL, 16);
-    uint32_t len = cmd.substring(p1 + 1, p2).toInt();
-    int patType = cmd.substring(p2 + 1, p3).toInt();
-    uint8_t customVal = (uint8_t)strtoul(cmd.substring(p3 + 1).c_str(), NULL, 16);
-
+  else if (action == "VERIFY" && count >= 5) {
+    uint32_t addr = parseHex(tokens[1]);
+    uint32_t len = tokens[2].toInt();
+    int patType = tokens[3].toInt();
+    uint8_t customVal = (uint8_t)parseHex(tokens[4]);
     uint32_t dummyErrs = 0;
     verifyPattern(addr, len, patType, customVal, dummyErrs);
   }
-  else if (cmd.startsWith("VERIFY_FULL_PAT:")) {
-    int p1 = cmd.indexOf(':', 16);
-    int patType = cmd.substring(16, p1).toInt();
-    uint8_t customVal = (uint8_t)strtoul(cmd.substring(p1 + 1).c_str(), NULL, 16);
-
+  else if (action == "VERIFY_FULL_PAT" && count >= 3) {
+    int patType = tokens[1].toInt();
+    uint8_t customVal = (uint8_t)parseHex(tokens[2]);
     uint32_t dummyErrs = 0;
     verifyPattern(0x000000, FLASH_SIZE_2MB, patType, customVal, dummyErrs);
   }
-  else if (cmd.startsWith("READ:")) {
-    int idx = cmd.indexOf(':', 5);
-    uint32_t addr = strtoul(cmd.substring(5, idx).c_str(), NULL, 16);
-    int len = cmd.substring(idx + 1).toInt();
+  else if (action == "LOOP_START" && count >= 6) {
+    int scope = tokens[1].toInt();
+    uint32_t addr = parseHex(tokens[2]);
+    uint32_t len = tokens[3].toInt();
+    int patType = tokens[4].toInt();
+    uint8_t customVal = (uint8_t)parseHex(tokens[5]);
+    runLoopTest(scope, addr, len, patType, customVal);
+  }
+  else if (action == "ALL_PAT_START" && count >= 2) {
+    bool isLoop = (tokens[1].toInt() == 1);
+    runAllPatternSweep(isLoop);
+  }
+  else if (action == "READ" && count >= 3) {
+    uint32_t addr = parseHex(tokens[1]);
+    int len = tokens[2].toInt();
     if (len <= 0) len = 16;
     if (len > 512) len = 512;
 
