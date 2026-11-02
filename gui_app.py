@@ -8,11 +8,11 @@ class FlashProgrammerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("SST26VF016B Tester & Programmer - ESP32")
-        self.root.geometry("860x580")
+        self.root.geometry("860x600")
         self.root.resizable(False, False)
         
         self.ser = None
-        self.current_hex_addr = 0x000000
+        self.target_hex_addr = 0x000000
         self.bytes_per_page = 256
         self.stop_requested = False
 
@@ -47,7 +47,6 @@ class FlashProgrammerGUI:
         self.freq_cb.grid(row=0, column=7, padx=2, pady=8)
         self.freq_cb.bind("<<ComboboxSelected>>", self.on_freq_changed)
 
-        # Progress Bar & % Display
         prog_frame = ttk.Frame(top_bar)
         prog_frame.grid(row=0, column=8, padx=(10, 5), pady=8, sticky="e")
         top_bar.grid_columnconfigure(8, weight=1)
@@ -59,7 +58,6 @@ class FlashProgrammerGUI:
         self.lbl_progress = ttk.Label(prog_frame, text="0%", font=("Segoe UI", 9, "bold"), width=4)
         self.lbl_progress.pack(side="left", padx=2)
 
-        # ปุ่มตัดการทำงาน (STOP Button)
         btn_stop = tk.Button(prog_frame, text="⛔ STOP", command=self.cmd_stop, bg="#FF3B30", fg="white", font=("Segoe UI", 8, "bold"), relief="flat", padx=6)
         btn_stop.pack(side="left", padx=(5, 2))
 
@@ -72,12 +70,12 @@ class FlashProgrammerGUI:
         self.notebook.add(self.tab_status, text=" 📊 Device Status ")
         self.setup_tab_status()
 
-        # Tab 2: Memory Operations
+        # Tab 2: Memory Operations (จัดระเบียบใหม่ด้วย Dropdown)
         self.tab_ops = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_ops, text=" ⚡ Memory Operations ")
         self.setup_tab_ops()
 
-        # Tab 3: Hex Viewer
+        # Tab 3: Hex Viewer (ระบบคลิกกดโหลดหน้า)
         self.tab_hex = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_hex, text=" 🔍 Hex Viewer ")
         self.setup_tab_hex()
@@ -85,7 +83,6 @@ class FlashProgrammerGUI:
         self.refresh_ports()
 
     def cmd_stop(self):
-        """ส่งคำสั่งตัดการทำงานไปยัง ESP32 ทันที"""
         self.stop_requested = True
         if self.ser and self.ser.is_open:
             try:
@@ -135,69 +132,114 @@ class FlashProgrammerGUI:
         self.lbl_cfg_reg.pack(anchor="w", pady=2)
 
     def setup_tab_ops(self):
-        ctrl_frame = ttk.LabelFrame(self.tab_ops, text=" Test Configuration ")
-        ctrl_frame.pack(fill="x", padx=10, pady=5)
+        """จัดระเบียบหน้า Test Configuration ใหม่ให้อยู่ในระเบียบ"""
+        cfg_frame = ttk.LabelFrame(self.tab_ops, text=" Execution & Pattern Parameters ")
+        cfg_frame.pack(fill="x", padx=10, pady=5)
 
-        ttk.Label(ctrl_frame, text="Address (Hex):").grid(row=0, column=0, padx=5, pady=5, sticky="e")
-        self.ent_addr = ttk.Entry(ctrl_frame, width=10)
+        # Row 0: Action Mode Dropdown & Scope Selection
+        ttk.Label(cfg_frame, text="Operation Mode:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.op_mode_cb = ttk.Combobox(cfg_frame, width=22, state="readonly")
+        self.op_mode_cb['values'] = [
+            "✍️ Write Pattern",
+            "🔍 Verify Pattern",
+            "🗑️ Erase Sector (4KB)",
+            "💥 Erase Full Chip (2MB)",
+            "📖 Read Data (Hex)"
+        ]
+        self.op_mode_cb.current(0)
+        self.op_mode_cb.grid(row=0, column=1, padx=5, pady=5)
+        self.op_mode_cb.bind("<<ComboboxSelected>>", self.on_op_mode_changed)
+
+        ttk.Label(cfg_frame, text="Scope:").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.scope_cb = ttk.Combobox(cfg_frame, width=16, state="readonly")
+        self.scope_cb['values'] = ["Selected Range", "Entire Chip (2MB)"]
+        self.scope_cb.current(0)
+        self.scope_cb.grid(row=0, column=3, padx=5, pady=5)
+
+        # Row 1: Address & Length
+        ttk.Label(cfg_frame, text="Address (Hex):").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        self.ent_addr = ttk.Entry(cfg_frame, width=12)
         self.ent_addr.insert(0, "0x000000")
-        self.ent_addr.grid(row=0, column=1, padx=5, pady=5)
+        self.ent_addr.grid(row=1, column=1, padx=5, pady=5)
 
-        ttk.Label(ctrl_frame, text="Length (Bytes):").grid(row=0, column=2, padx=5, pady=5, sticky="e")
-        self.ent_len = ttk.Entry(ctrl_frame, width=10)
+        ttk.Label(cfg_frame, text="Length (Bytes):").grid(row=1, column=2, padx=5, pady=5, sticky="e")
+        self.ent_len = ttk.Entry(cfg_frame, width=12)
         self.ent_len.insert(0, "4096")
-        self.ent_len.grid(row=0, column=3, padx=5, pady=5)
+        self.ent_len.grid(row=1, column=3, padx=5, pady=5)
 
-        ttk.Label(ctrl_frame, text="Pattern:").grid(row=0, column=4, padx=5, pady=5, sticky="e")
-        self.pat_cb = ttk.Combobox(ctrl_frame, width=18, state="readonly")
+        # Row 2: Pattern Select & Custom Byte Input
+        ttk.Label(cfg_frame, text="Pattern Type:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        self.pat_cb = ttk.Combobox(cfg_frame, width=22, state="readonly")
         self.pat_cb['values'] = [
             "0: All 0xAA",
             "1: All 0x55",
             "2: Alt 0xAA / 0x55",
             "3: Inc (0x00-0xFF)",
-            "4: All 0x00"
+            "4: All 0x00",
+            "5: 🎲 Pseudo-Random (สุ่ม)",
+            "6: ✏️ Custom Hex (กำหนดเอง)"
         ]
         self.pat_cb.current(0)
-        self.pat_cb.grid(row=0, column=5, padx=5, pady=5)
+        self.pat_cb.grid(row=2, column=1, padx=5, pady=5)
+        self.pat_cb.bind("<<ComboboxSelected>>", self.on_pattern_changed)
 
-        btn_frame1 = ttk.Frame(self.tab_ops)
-        btn_frame1.pack(fill="x", padx=10, pady=2)
+        ttk.Label(cfg_frame, text="Custom Hex (0x):").grid(row=2, column=2, padx=5, pady=5, sticky="e")
+        self.ent_custom_hex = ttk.Entry(cfg_frame, width=12, state="disabled")
+        self.ent_custom_hex.insert(0, "AA")
+        self.ent_custom_hex.grid(row=2, column=3, padx=5, pady=5)
 
-        ttk.Button(btn_frame1, text="🗑️ Erase Sector", command=self.cmd_erase_sector).grid(row=0, column=0, padx=4, pady=4)
-        ttk.Button(btn_frame1, text="💥 Erase Full Chip (2MB)", command=self.cmd_erase_chip).grid(row=0, column=1, padx=4, pady=4)
-        ttk.Button(btn_frame1, text="✍️ Write Range Pattern", command=self.cmd_write_pat).grid(row=0, column=2, padx=4, pady=4)
-        ttk.Button(btn_frame1, text="🔍 Verify Range", command=self.cmd_verify_pat).grid(row=0, column=3, padx=4, pady=4)
+        # Action Execution Bar
+        act_frame = ttk.Frame(self.tab_ops)
+        act_frame.pack(fill="x", padx=10, pady=5)
 
-        btn_frame2 = ttk.Frame(self.tab_ops)
-        btn_frame2.pack(fill="x", padx=10, pady=2)
+        btn_exec = ttk.Button(act_frame, text="▶ ดำเนินการ (Execute Operation)", command=self.cmd_execute_action)
+        btn_exec.pack(side="left", padx=5)
 
-        ttk.Button(btn_frame2, text="🚀 Write Full Chip (2MB)", command=self.cmd_write_full_chip).grid(row=0, column=0, padx=4, pady=4)
-        ttk.Button(btn_frame2, text="🕵️ Verify Full Chip (Show Fails)", command=self.cmd_verify_full_chip).grid(row=0, column=1, padx=4, pady=4)
-        ttk.Button(btn_frame2, text="📖 Read Data (Hex)", command=self.cmd_read_data).grid(row=0, column=2, padx=4, pady=4)
-        ttk.Button(btn_frame2, text="🧹 Clear Log", command=self.cmd_clear_log).grid(row=0, column=3, padx=4, pady=4)
+        btn_clear = ttk.Button(act_frame, text="🧹 Clear Log", command=self.cmd_clear_log)
+        btn_clear.pack(side="right", padx=5)
 
+        # Output Log Box
         log_frame = ttk.LabelFrame(self.tab_ops, text=" Operation Log ")
         log_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.txt_ops_log = scrolledtext.ScrolledText(log_frame, height=10, font=("Consolas", 9), state="disabled")
         self.txt_ops_log.pack(fill="both", expand=True, padx=5, pady=5)
 
+    def on_op_mode_changed(self, event=None):
+        mode = self.op_mode_cb.get()
+        if "Full Chip" in mode or "Sector" in mode:
+            if "Full Chip" in mode:
+                self.scope_cb.set("Entire Chip (2MB)")
+            self.ent_len.config(state="disabled")
+        else:
+            self.ent_len.config(state="normal")
+
+    def on_pattern_changed(self, event=None):
+        pat_idx = self.pat_cb.get().split(":")[0]
+        if pat_idx == "6":
+            self.ent_custom_hex.config(state="normal")
+        else:
+            self.ent_custom_hex.config(state="disabled")
+
     def setup_tab_hex(self):
-        nav_frame = ttk.LabelFrame(self.tab_hex, text=" Navigation & Controls ")
+        """ระบบ Hex Viewer ที่เปลี่ยนหน้าเฉพาะตัวเลข และต้องกดปุ่มเพื่อโหลดข้อมูล"""
+        nav_frame = ttk.LabelFrame(self.tab_hex, text=" Navigation & Page Selection ")
         nav_frame.pack(fill="x", padx=10, pady=5)
 
-        ttk.Label(nav_frame, text="Address (Hex):").grid(row=0, column=0, padx=5, pady=5)
+        ttk.Label(nav_frame, text="Target Address (Hex):").grid(row=0, column=0, padx=5, pady=5)
         self.ent_hex_jump = ttk.Entry(nav_frame, width=12)
         self.ent_hex_jump.insert(0, "0x000000")
         self.ent_hex_jump.grid(row=0, column=1, padx=5, pady=5)
 
-        ttk.Button(nav_frame, text="🎯 Jump", command=self.cmd_hex_jump).grid(row=0, column=2, padx=5, pady=5)
-        ttk.Button(nav_frame, text="◀ Prev Page", command=self.cmd_hex_prev).grid(row=0, column=3, padx=5, pady=5)
-        ttk.Button(nav_frame, text="Next Page ▶", command=self.cmd_hex_next).grid(row=0, column=4, padx=5, pady=5)
-        ttk.Button(nav_frame, text="🔄 Read & Refresh", command=self.load_hex_view_page).grid(row=0, column=5, padx=5, pady=5)
+        ttk.Button(nav_frame, text="◀ Prev Page", command=self.cmd_hex_prev_page).grid(row=0, column=2, padx=5, pady=5)
+        ttk.Button(nav_frame, text="Next Page ▶", command=self.cmd_hex_next_page).grid(row=0, column=3, padx=5, pady=5)
+        
+        # ปุ่มกดโหลดหน้า (โหลดเมื่อผู้ใช้กดเท่านั้น)
+        btn_load_hex = ttk.Button(nav_frame, text="📥 โหลดข้อมูล (Load Page)", command=self.load_hex_view_page)
+        btn_load_hex.grid(row=0, column=4, padx=10, pady=5)
 
-        self.lbl_hex_page_info = ttk.Label(nav_frame, text="Page: 0x000000 - 0x0000FF", font=("Consolas", 9, "bold"))
-        self.lbl_hex_page_info.grid(row=0, column=6, padx=15, pady=5)
+        self.lbl_hex_page_info = ttk.Label(nav_frame, text="Target Page: 0x000000 - 0x0000FF", font=("Consolas", 9, "bold"))
+        self.lbl_hex_page_info.grid(row=0, column=5, padx=15, pady=5)
 
         view_frame = ttk.LabelFrame(self.tab_hex, text=" Data Memory Array ")
         view_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -205,10 +247,39 @@ class FlashProgrammerGUI:
         self.txt_hex_display = scrolledtext.ScrolledText(view_frame, font=("Consolas", 10), state="disabled", bg="#1E1E1E", fg="#D4D4D4")
         self.txt_hex_display.pack(fill="both", expand=True, padx=5, pady=5)
 
+    def update_hex_page_label(self):
+        self.lbl_hex_page_info.config(text=f"Target Page: 0x{self.target_hex_addr:06X} - 0x{self.target_hex_addr + self.bytes_per_page - 1:06X}")
+
+    def cmd_hex_prev_page(self):
+        if self.target_hex_addr >= self.bytes_per_page:
+            self.target_hex_addr -= self.bytes_per_page
+            self.ent_hex_jump.delete(0, tk.END)
+            self.ent_hex_jump.insert(0, f"0x{self.target_hex_addr:06X}")
+            self.update_hex_page_label()
+
+    def cmd_hex_next_page(self):
+        if self.target_hex_addr + self.bytes_per_page < 0x200000:
+            self.target_hex_addr += self.bytes_per_page
+            self.ent_hex_jump.delete(0, tk.END)
+            self.ent_hex_jump.insert(0, f"0x{self.target_hex_addr:06X}")
+            self.update_hex_page_label()
+
     def load_hex_view_page(self):
-        addr_str = f"0x{self.current_hex_addr:06X}"
-        self.lbl_hex_page_info.config(text=f"Page: 0x{self.current_hex_addr:06X} - 0x{self.current_hex_addr + self.bytes_per_page - 1:06X}")
-        
+        """โหลดข้อมูลอ่านเฉพาะตอนกดปุ่มเท่านั้น"""
+        try:
+            addr = int(self.ent_hex_jump.get().strip(), 16)
+            addr = addr & ~0xF
+            if 0 <= addr < 0x200000:
+                self.target_hex_addr = addr
+                self.update_hex_page_label()
+            else:
+                messagebox.showerror("Error", "Address out of range (0x000000 - 0x1FFFFF)")
+                return
+        except ValueError:
+            messagebox.showerror("Error", "Invalid Hex Address format")
+            return
+
+        addr_str = f"0x{self.target_hex_addr:06X}"
         resp = self.execute_cmd_with_progress(f"READ:{addr_str}:{self.bytes_per_page}", ["DATA:"])
         if not resp or not resp.startswith("DATA:"):
             return
@@ -226,7 +297,7 @@ class FlashProgrammerGUI:
 
         for i in range(0, len(raw_bytes), 16):
             chunk = raw_bytes[i:i+16]
-            row_addr = f"{self.current_hex_addr + i:08X}"
+            row_addr = f"{self.target_hex_addr + i:08X}"
             
             hex_b1 = " ".join(f"{b:02X}" for b in chunk[:8])
             hex_b2 = " ".join(f"{b:02X}" for b in chunk[8:])
@@ -240,32 +311,6 @@ class FlashProgrammerGUI:
         self.txt_hex_display.delete('1.0', tk.END)
         self.txt_hex_display.insert(tk.END, "\n".join(lines))
         self.txt_hex_display.config(state="disabled")
-
-    def cmd_hex_jump(self):
-        try:
-            addr = int(self.ent_hex_jump.get().strip(), 16)
-            addr = addr & ~0xF
-            if 0 <= addr < 0x200000:
-                self.current_hex_addr = addr
-                self.load_hex_view_page()
-            else:
-                messagebox.showerror("Error", "Address out of range (0x000000 - 0x1FFFFF)")
-        except ValueError:
-            messagebox.showerror("Error", "Invalid Hex Address format")
-
-    def cmd_hex_prev(self):
-        if self.current_hex_addr >= self.bytes_per_page:
-            self.current_hex_addr -= self.bytes_per_page
-            self.ent_hex_jump.delete(0, tk.END)
-            self.ent_hex_jump.insert(0, f"0x{self.current_hex_addr:06X}")
-            self.load_hex_view_page()
-
-    def cmd_hex_next(self):
-        if self.current_hex_addr + self.bytes_per_page < 0x200000:
-            self.current_hex_addr += self.bytes_per_page
-            self.ent_hex_jump.delete(0, tk.END)
-            self.ent_hex_jump.insert(0, f"0x{self.current_hex_addr:06X}")
-            self.load_hex_view_page()
 
     def ops_log(self, text):
         self.txt_ops_log.config(state="normal")
@@ -321,7 +366,7 @@ class FlashProgrammerGUI:
         except Exception:
             return None
 
-    def execute_cmd_with_progress(self, command, expected_end_tokens, timeout=45.0):
+    def execute_cmd_with_progress(self, command, expected_end_tokens, timeout=60.0):
         if not self.ser or not self.ser.is_open:
             messagebox.showwarning("Warning", "Please connect to COM Port first!")
             return None
@@ -362,12 +407,11 @@ class FlashProgrammerGUI:
                         pass
                 elif line.startswith("FAIL_ADDR:"):
                     printed_errors += 1
-                    # ป้องกันข้อความขยะถล่มหน้าจอ: แสดงผลสูงสุดเฉพาะ 20 รายการแรก
                     if printed_errors <= 20:
                         parts = line.split(":")
                         self.ops_log(f"  ❌ Mismatch @ {parts[1]} | Details: {parts[2]}")
                     elif printed_errors == 21:
-                        self.ops_log("  ⚠️ [NOTICE] Mismatch count exceeds 20. Suppressing further error prints to avoid UI lag...")
+                        self.ops_log("  ⚠️ [NOTICE] Mismatch count exceeds 20. Suppressing further error prints...")
                     self.root.update()
                 elif line == "ABORTED":
                     self.ops_log("[ABORTED] Hardware operation canceled.")
@@ -387,6 +431,80 @@ class FlashProgrammerGUI:
             self.ops_log(f"[ERROR] Communication failure: {e}")
             self.set_led_status(False)
             return None
+
+    def get_custom_hex_val(self):
+        val_str = self.ent_custom_hex.get().strip()
+        try:
+            val = int(val_str, 16)
+            return f"{val:02X}"
+        except ValueError:
+            return "00"
+
+    def cmd_execute_action(self):
+        """ประมวลผลตาม Operation Mode และ Scope ที่เลือก"""
+        mode = self.op_mode_cb.get()
+        scope = self.scope_cb.get()
+        addr = self.ent_addr.get().strip()
+        length = self.ent_len.get().strip()
+        pat_idx = self.pat_cb.get().split(":")[0]
+        custom_hex = self.get_custom_hex_val()
+
+        if "Write Pattern" in mode:
+            if scope == "Entire Chip (2MB)":
+                self.ops_log(f"[ACTION] Writing Pattern #{pat_idx} (Custom: 0x{custom_hex}) to ENTIRE CHIP (2MB)...")
+                t0 = time.time()
+                resp = self.execute_cmd_with_progress(f"WRITE_FULL_PAT:{pat_idx}:{custom_hex}", ["WRITE_PAT:OK"])
+                t1 = time.time()
+                if resp == "WRITE_PAT:OK":
+                    self.ops_log(f"[SUCCESS] 🚀 Full Chip Written in {t1-t0:.2f}s!")
+            else:
+                self.ops_log(f"[ACTION] Writing Pattern #{pat_idx} to {addr} (Len: {length} bytes)...")
+                t0 = time.time()
+                resp = self.execute_cmd_with_progress(f"WRITE_PAT:{addr}:{length}:{pat_idx}:{custom_hex}", ["WRITE_PAT:OK"])
+                t1 = time.time()
+                if resp == "WRITE_PAT:OK":
+                    self.ops_log(f"[SUCCESS] Pattern Written in {t1-t0:.3f}s!")
+
+        elif "Verify Pattern" in mode:
+            if scope == "Entire Chip (2MB)":
+                self.ops_log(f"[ACTION] Verifying ENTIRE CHIP with Pattern #{pat_idx}...")
+                t0 = time.time()
+                resp = self.execute_cmd_with_progress(f"VERIFY_FULL_PAT:{pat_idx}:{custom_hex}", ["VERIFY_FULL:DONE:"])
+                t1 = time.time()
+                if resp and resp.startswith("VERIFY_FULL:DONE:"):
+                    total_errors = int(resp.split(":")[2])
+                    if total_errors == 0:
+                        self.ops_log(f"[PASSED] 🟢 Full Chip Verification PASSED in {t1-t0:.2f}s!")
+                    else:
+                        self.ops_log(f"[FAILED] 🔴 Full Chip Verification FAILED! Total {total_errors:,} Mismatched Bytes.")
+            else:
+                self.ops_log(f"[ACTION] Verifying Pattern #{pat_idx} at {addr} (Len: {length} bytes)...")
+                t0 = time.time()
+                resp = self.execute_cmd_with_progress(f"VERIFY:{addr}:{length}:{pat_idx}:{custom_hex}", ["VERIFY:OK", "VERIFY:FAIL:"])
+                t1 = time.time()
+                if resp == "VERIFY:OK":
+                    self.ops_log(f"[PASSED] 🟢 Verification PASSED (0 Errors) in {t1-t0:.3f}s!")
+                elif resp and resp.startswith("VERIFY:FAIL:"):
+                    parts = resp.split(":")
+                    self.ops_log(f"[FAILED] 🔴 Verification FAILED! ({parts[2]} errors). First Mismatch @ {parts[3]} [{parts[4]}]")
+
+        elif "Erase Sector" in mode:
+            self.ops_log(f"[ACTION] Erasing Sector at {addr}...")
+            resp = self.execute_cmd_with_progress(f"ERASE:{addr}", ["ERASE:OK"])
+            if resp == "ERASE:OK":
+                self.ops_log(f"[SUCCESS] Sector {addr} Erased.")
+
+        elif "Erase Full Chip" in mode:
+            if messagebox.askyesno("Confirm Erase", "Are you sure you want to erase ENTIRE CHIP (2MB)?"):
+                self.ops_log("[ACTION] Erasing ENTIRE CHIP (2 Megabytes)... Please wait...")
+                resp = self.execute_cmd_with_progress("ERASE_CHIP", ["ERASE_CHIP:OK"])
+                if resp == "ERASE_CHIP:OK":
+                    self.ops_log("[SUCCESS] 💥 Entire Chip Erased Successfully!")
+
+        elif "Read Data" in mode:
+            resp = self.execute_cmd_with_progress(f"READ:{addr}:{length}", ["DATA:"])
+            if resp and resp.startswith("DATA:"):
+                self.ops_log(f"[READ @ {addr}] {resp[5:]}")
 
     def cmd_read_id(self):
         resp = self.execute_cmd_with_progress("READ_ID", ["ID:"])
@@ -415,98 +533,6 @@ class FlashProgrammerGUI:
             self.lbl_cfg_reg.config(text=f"Config Reg (0x35): 0x{cfg_hex}  [ IOC: {ioc} | BPNV: {bpnv} ]")
         else:
             messagebox.showerror("Error", "Failed to read registers")
-
-    def cmd_erase_sector(self):
-        addr = self.ent_addr.get().strip()
-        self.ops_log(f"[ACTION] Erasing 4KB Sector at {addr}...")
-        resp = self.execute_cmd_with_progress(f"ERASE:{addr}", ["ERASE:OK"])
-        if resp == "ERASE:OK":
-            self.ops_log(f"[SUCCESS] Sector {addr} Erased.")
-        else:
-            self.ops_log(f"[FAIL] Erase failed: {resp}")
-
-    def cmd_erase_chip(self):
-        if not messagebox.askyesno("Confirm Erase", "Are you sure you want to erase ENTIRE CHIP (2MB)?"):
-            return
-        self.ops_log("[ACTION] Erasing ENTIRE CHIP (2 Megabytes)... Please wait...")
-        resp = self.execute_cmd_with_progress("ERASE_CHIP", ["ERASE_CHIP:OK"], timeout=60.0)
-        if resp == "ERASE_CHIP:OK":
-            self.ops_log("[SUCCESS] 💥 Entire Chip Erased Successfully!")
-        else:
-            self.ops_log(f"[FAIL] Chip Erase failed: {resp}")
-
-    def cmd_write_pat(self):
-        addr = self.ent_addr.get().strip()
-        length = self.ent_len.get().strip()
-        pat_idx = self.pat_cb.get().split(":")[0]
-        self.ops_log(f"[ACTION] Writing Pattern #{pat_idx} to {addr} (Len: {length} bytes)...")
-        
-        t0 = time.time()
-        resp = self.execute_cmd_with_progress(f"WRITE_PAT:{addr}:{length}:{pat_idx}", ["WRITE_PAT:OK"])
-        t1 = time.time()
-
-        if resp == "WRITE_PAT:OK":
-            self.ops_log(f"[SUCCESS] Pattern Written in {t1-t0:.3f} seconds!")
-        else:
-            self.ops_log(f"[FAIL] Write Pattern failed: {resp}")
-
-    def cmd_write_full_chip(self):
-        pat_idx = self.pat_cb.get().split(":")[0]
-        self.ops_log(f"[ACTION] Writing Pattern #{pat_idx} to ENTIRE CHIP (2MB)...")
-        
-        t0 = time.time()
-        resp = self.execute_cmd_with_progress(f"WRITE_FULL_PAT:{pat_idx}", ["WRITE_PAT:OK"], timeout=60.0)
-        t1 = time.time()
-
-        if resp == "WRITE_PAT:OK":
-            self.ops_log(f"[SUCCESS] 🚀 Full Chip Written in {t1-t0:.2f} seconds!")
-        else:
-            self.ops_log(f"[FAIL] Write Full Chip failed: {resp}")
-
-    def cmd_verify_pat(self):
-        addr = self.ent_addr.get().strip()
-        length = self.ent_len.get().strip()
-        pat_idx = self.pat_cb.get().split(":")[0]
-        self.ops_log(f"[ACTION] Verifying Pattern #{pat_idx} at {addr} (Len: {length} bytes)...")
-
-        t0 = time.time()
-        resp = self.execute_cmd_with_progress(f"VERIFY:{addr}:{length}:{pat_idx}", ["VERIFY:OK", "VERIFY:FAIL:"])
-        t1 = time.time()
-
-        if resp == "VERIFY:OK":
-            self.ops_log(f"[PASSED] 🟢 Verification PASSED (0 Errors) in {t1-t0:.3f}s!")
-        elif resp and resp.startswith("VERIFY:FAIL:"):
-            parts = resp.split(":")
-            err_cnt, err_addr, detail = parts[2], parts[3], parts[4]
-            self.ops_log(f"[FAILED] 🔴 Verification FAILED! ({err_cnt} errors). First Mismatch @ {err_addr} [{detail}]")
-        else:
-            self.ops_log(f"[FAIL] Verify command failed: {resp}")
-
-    def cmd_verify_full_chip(self):
-        pat_idx = self.pat_cb.get().split(":")[0]
-        self.ops_log(f"[ACTION] Verifying ENTIRE CHIP with Pattern #{pat_idx}...")
-
-        t0 = time.time()
-        resp = self.execute_cmd_with_progress(f"VERIFY_FULL_PAT:{pat_idx}", ["VERIFY_FULL:DONE:"], timeout=60.0)
-        t1 = time.time()
-
-        if resp and resp.startswith("VERIFY_FULL:DONE:"):
-            total_errors = int(resp.split(":")[2])
-            if total_errors == 0:
-                self.ops_log(f"[PASSED] 🟢 Full Chip Verification PASSED (0 Failures) in {t1-t0:.2f}s!")
-            else:
-                self.ops_log(f"[FAILED] 🔴 Full Chip Verification FAILED! Total {total_errors:,} Mismatched Bytes in {t1-t0:.2f}s.")
-        else:
-            self.ops_log(f"[FAIL] Full verify failed: {resp}")
-
-    def cmd_read_data(self):
-        addr = self.ent_addr.get().strip()
-        length = self.ent_len.get().strip()
-        resp = self.execute_cmd_with_progress(f"READ:{addr}:{length}", ["DATA:"])
-        if resp and resp.startswith("DATA:"):
-            self.ops_log(f"[READ @ {addr}] {resp[5:]}")
-        else:
-            self.ops_log(f"[FAIL] Read failed: {resp}")
 
 if __name__ == "__main__":
     root = tk.Tk()

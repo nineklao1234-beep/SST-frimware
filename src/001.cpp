@@ -15,9 +15,8 @@
 
 #define FLASH_SIZE_2MB   0x200000  // 2,097,152 Bytes
 
-uint32_t currentSpiFreqHz = 10000000; // ค่าเริ่มต้น 10 MHz
+uint32_t currentSpiFreqHz = 10000000;
 
-// ฟังก์ชันเช็กคำสั่งยกเลิกกลางคันจาก GUI
 bool checkStopCommand() {
   if (Serial.available()) {
     String input = Serial.readStringUntil('\n');
@@ -61,18 +60,26 @@ void writeEnable() {
   SPI.endTransaction();
 }
 
-uint8_t getPatternByte(uint32_t offset, int patternType) {
+// ฟังก์ชันสร้าง Pattern รองรับแบบสุ่ม และ Custom Byte
+uint8_t getPatternByte(uint32_t offset, int patternType, uint8_t customVal = 0x00) {
   switch (patternType) {
     case 0: return 0xAA;
     case 1: return 0x55;
     case 2: return (offset % 2 == 0) ? 0xAA : 0x55;
     case 3: return (uint8_t)(offset & 0xFF);
     case 4: return 0x00;
+    case 5: { // Pseudo-Random (Deterministic ตาม offset เพื่อให้เขียนและ Verify ตรงกัน)
+      uint32_t hash = offset ^ 0x5BF03635;
+      hash = (hash ^ (hash >> 16)) * 0x45d9f3b;
+      hash = (hash ^ (hash >> 16)) * 0x45d9f3b;
+      return (uint8_t)((hash ^ (hash >> 16)) & 0xFF);
+    }
+    case 6: return customVal; // Custom Hex Byte
     default: return 0xFF;
   }
 }
 
-void writePattern(uint32_t addr, uint32_t len, int patternType) {
+void writePattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVal) {
   uint32_t bytesWritten = 0;
   uint8_t pageBuf[256];
   int lastPct = -1;
@@ -92,7 +99,7 @@ void writePattern(uint32_t addr, uint32_t len, int patternType) {
     }
 
     for (uint16_t i = 0; i < chunkSize; i++) {
-      pageBuf[i] = getPatternByte(bytesWritten + i, patternType);
+      pageBuf[i] = getPatternByte(bytesWritten + i, patternType, customVal);
     }
 
     writeEnable();
@@ -133,7 +140,7 @@ void writePattern(uint32_t addr, uint32_t len, int patternType) {
   Serial.println("WRITE_PAT:OK");
 }
 
-void verifyPattern(uint32_t addr, uint32_t len, int patternType) {
+void verifyPattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVal) {
   uint32_t errors = 0;
   uint32_t firstErrAddr = 0;
   uint8_t expectedErr = 0, actualErr = 0;
@@ -157,7 +164,7 @@ void verifyPattern(uint32_t addr, uint32_t len, int patternType) {
     }
 
     uint8_t actual = SPI.transfer(0x00);
-    uint8_t expected = getPatternByte(i, patternType);
+    uint8_t expected = getPatternByte(i, patternType, customVal);
 
     if (actual != expected) {
       if (errors == 0) {
@@ -186,7 +193,7 @@ void verifyPattern(uint32_t addr, uint32_t len, int patternType) {
   }
 }
 
-void verifyFullChip(int patternType) {
+void verifyFullChip(int patternType, uint8_t customVal) {
   uint32_t totalErrors = 0;
   const uint32_t maxPrintedErrors = 100;
   int lastPct = -1;
@@ -209,7 +216,7 @@ void verifyFullChip(int patternType) {
     }
 
     uint8_t actual = SPI.transfer(0x00);
-    uint8_t expected = getPatternByte(i, patternType);
+    uint8_t expected = getPatternByte(i, patternType, customVal);
 
     if (actual != expected) {
       totalErrors++;
@@ -315,30 +322,44 @@ void processCommand(String cmd) {
     Serial.println("ERASE_CHIP:OK");
   }
   else if (cmd.startsWith("WRITE_PAT:")) {
+    // Format: WRITE_PAT:<ADDR>:<LEN>:<PAT_TYPE>:<CUSTOM_HEX>
     int p1 = cmd.indexOf(':', 10);
     int p2 = cmd.indexOf(':', p1 + 1);
+    int p3 = cmd.indexOf(':', p2 + 1);
     uint32_t addr = strtoul(cmd.substring(10, p1).c_str(), NULL, 16);
     uint32_t len = cmd.substring(p1 + 1, p2).toInt();
-    int patType = cmd.substring(p2 + 1).toInt();
+    int patType = cmd.substring(p2 + 1, p3).toInt();
+    uint8_t customVal = (uint8_t)strtoul(cmd.substring(p3 + 1).c_str(), NULL, 16);
 
-    writePattern(addr, len, patType);
+    writePattern(addr, len, patType, customVal);
   }
   else if (cmd.startsWith("WRITE_FULL_PAT:")) {
-    int patType = cmd.substring(15).toInt();
-    writePattern(0x000000, FLASH_SIZE_2MB, patType);
+    // Format: WRITE_FULL_PAT:<PAT_TYPE>:<CUSTOM_HEX>
+    int p1 = cmd.indexOf(':', 15);
+    int patType = cmd.substring(15, p1).toInt();
+    uint8_t customVal = (uint8_t)strtoul(cmd.substring(p1 + 1).c_str(), NULL, 16);
+
+    writePattern(0x000000, FLASH_SIZE_2MB, patType, customVal);
   }
   else if (cmd.startsWith("VERIFY:")) {
+    // Format: VERIFY:<ADDR>:<LEN>:<PAT_TYPE>:<CUSTOM_HEX>
     int p1 = cmd.indexOf(':', 7);
     int p2 = cmd.indexOf(':', p1 + 1);
+    int p3 = cmd.indexOf(':', p2 + 1);
     uint32_t addr = strtoul(cmd.substring(7, p1).c_str(), NULL, 16);
     uint32_t len = cmd.substring(p1 + 1, p2).toInt();
-    int patType = cmd.substring(p2 + 1).toInt();
+    int patType = cmd.substring(p2 + 1, p3).toInt();
+    uint8_t customVal = (uint8_t)strtoul(cmd.substring(p3 + 1).c_str(), NULL, 16);
 
-    verifyPattern(addr, len, patType);
+    verifyPattern(addr, len, patType, customVal);
   }
   else if (cmd.startsWith("VERIFY_FULL_PAT:")) {
-    int patType = cmd.substring(16).toInt();
-    verifyFullChip(patType);
+    // Format: VERIFY_FULL_PAT:<PAT_TYPE>:<CUSTOM_HEX>
+    int p1 = cmd.indexOf(':', 16);
+    int patType = cmd.substring(16, p1).toInt();
+    uint8_t customVal = (uint8_t)strtoul(cmd.substring(p1 + 1).c_str(), NULL, 16);
+
+    verifyFullChip(patType, customVal);
   }
   else if (cmd.startsWith("READ:")) {
     int idx = cmd.indexOf(':', 5);
