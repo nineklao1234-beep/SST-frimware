@@ -8,10 +8,12 @@ class FlashProgrammerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("SST26VF016B Tester & Programmer - ESP32")
-        self.root.geometry("760x540")
+        self.root.geometry("820x580")
         self.root.resizable(False, False)
         
         self.ser = None
+        self.current_hex_addr = 0x000000
+        self.bytes_per_page = 256
 
         style = ttk.Style()
         style.theme_use('clam')
@@ -20,7 +22,6 @@ class FlashProgrammerGUI:
         top_bar = ttk.LabelFrame(root, text=" Connection & Configuration ")
         top_bar.pack(fill="x", padx=10, pady=5)
 
-        # Port Selection
         ttk.Label(top_bar, text="Port:").grid(row=0, column=0, padx=(5,2), pady=8)
         self.port_cb = ttk.Combobox(top_bar, width=10, state="readonly")
         self.port_cb.grid(row=0, column=1, padx=2, pady=8)
@@ -31,7 +32,6 @@ class FlashProgrammerGUI:
         self.btn_connect = ttk.Button(top_bar, text="Connect", command=self.toggle_connection)
         self.btn_connect.grid(row=0, column=3, padx=2, pady=8)
 
-        # LED Indicator
         self.led_canvas = tk.Canvas(top_bar, width=18, height=18, highlightthickness=0)
         self.led_canvas.grid(row=0, column=4, padx=(8, 2), pady=8)
         self.led_circle = self.led_canvas.create_oval(2, 2, 16, 16, fill="#FF3B30", outline="#B30000")
@@ -39,15 +39,13 @@ class FlashProgrammerGUI:
         self.lbl_status = ttk.Label(top_bar, text="Disconnected", font=("Segoe UI", 9, "bold"), foreground="#FF3B30")
         self.lbl_status.grid(row=0, column=5, padx=(2, 10), pady=8)
 
-        # 3. เลือกความถี่ SPI Frequency Selection
         ttk.Label(top_bar, text="SPI Speed:").grid(row=0, column=6, padx=(10, 2), pady=8)
         self.freq_cb = ttk.Combobox(top_bar, width=8, state="readonly")
         self.freq_cb['values'] = ["1 MHz", "5 MHz", "10 MHz", "20 MHz", "40 MHz"]
-        self.freq_cb.current(2)  # Default 10 MHz
+        self.freq_cb.current(2)
         self.freq_cb.grid(row=0, column=7, padx=2, pady=8)
         self.freq_cb.bind("<<ComboboxSelected>>", self.on_freq_changed)
 
-        # 1. แถบความคืบหน้า มุมขวาบน (Progress Bar & %)
         prog_frame = ttk.Frame(top_bar)
         prog_frame.grid(row=0, column=8, padx=(15, 8), pady=8, sticky="e")
         top_bar.grid_columnconfigure(8, weight=1)
@@ -73,10 +71,14 @@ class FlashProgrammerGUI:
         self.notebook.add(self.tab_ops, text=" ⚡ Memory Operations ")
         self.setup_tab_ops()
 
+        # Tab 3: Dedicated Hex Viewer (หน้าใหม่แยกออกมา)
+        self.tab_hex = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_hex, text=" 🔍 Hex Viewer ")
+        self.setup_tab_hex()
+
         self.refresh_ports()
 
     def update_progress(self, pct):
-        """อัปเดตเปอร์เซ็นต์แบบก้าวทีละ 10%"""
         self.progress_var.set(pct)
         self.lbl_progress.config(text=f"{pct}%")
         self.root.update_idletasks()
@@ -142,16 +144,14 @@ class FlashProgrammerGUI:
         self.pat_cb.current(0)
         self.pat_cb.grid(row=0, column=5, padx=5, pady=5)
 
-        # Action Buttons (Row 1: Range Ops)
         btn_frame1 = ttk.Frame(self.tab_ops)
         btn_frame1.pack(fill="x", padx=10, pady=2)
 
         ttk.Button(btn_frame1, text="🗑️ Erase Sector", command=self.cmd_erase_sector).grid(row=0, column=0, padx=4, pady=4)
-        ttk.Button(btn_frame1, text="💥 Erase Full Chip (2MB)", command=self.cmd_erase_chip).grid(row=0, column=1, padx=4, pady=4) # 2. ปุ่มลบทั้งชิป
+        ttk.Button(btn_frame1, text="💥 Erase Full Chip (2MB)", command=self.cmd_erase_chip).grid(row=0, column=1, padx=4, pady=4)
         ttk.Button(btn_frame1, text="✍️ Write Range Pattern", command=self.cmd_write_pat).grid(row=0, column=2, padx=4, pady=4)
         ttk.Button(btn_frame1, text="🔍 Verify Range", command=self.cmd_verify_pat).grid(row=0, column=3, padx=4, pady=4)
 
-        # Action Buttons (Row 2: Full Chip & Utilities)
         btn_frame2 = ttk.Frame(self.tab_ops)
         btn_frame2.pack(fill="x", padx=10, pady=2)
 
@@ -160,12 +160,98 @@ class FlashProgrammerGUI:
         ttk.Button(btn_frame2, text="📖 Read Data (Hex)", command=self.cmd_read_data).grid(row=0, column=2, padx=4, pady=4)
         ttk.Button(btn_frame2, text="🧹 Clear Log", command=self.cmd_clear_log).grid(row=0, column=3, padx=4, pady=4)
 
-        # Output Log Box
         log_frame = ttk.LabelFrame(self.tab_ops, text=" Operation Log ")
         log_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.txt_ops_log = scrolledtext.ScrolledText(log_frame, height=10, font=("Consolas", 9), state="disabled")
         self.txt_ops_log.pack(fill="both", expand=True, padx=5, pady=5)
+
+    def setup_tab_hex(self):
+        """โครงสร้างหน้าใหม่: Hex Viewer Tab"""
+        nav_frame = ttk.LabelFrame(self.tab_hex, text=" Navigation & Controls ")
+        nav_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(nav_frame, text="Address (Hex):").grid(row=0, column=0, padx=5, pady=5)
+        self.ent_hex_jump = ttk.Entry(nav_frame, width=12)
+        self.ent_hex_jump.insert(0, "0x000000")
+        self.ent_hex_jump.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Button(nav_frame, text="🎯 Jump", command=self.cmd_hex_jump).grid(row=0, column=2, padx=5, pady=5)
+        ttk.Button(nav_frame, text="◀ Prev Page", command=self.cmd_hex_prev).grid(row=0, column=3, padx=5, pady=5)
+        ttk.Button(nav_frame, text="Next Page ▶", command=self.cmd_hex_next).grid(row=0, column=4, padx=5, pady=5)
+        ttk.Button(nav_frame, text="🔄 Read & Refresh", command=self.load_hex_view_page).grid(row=0, column=5, padx=5, pady=5)
+
+        self.lbl_hex_page_info = ttk.Label(nav_frame, text="Page: 0x000000 - 0x0000FF", font=("Consolas", 9, "bold"))
+        self.lbl_hex_page_info.grid(row=0, column=6, padx=15, pady=5)
+
+        view_frame = ttk.LabelFrame(self.tab_hex, text=" Data Memory Array ")
+        view_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.txt_hex_display = scrolledtext.ScrolledText(view_frame, font=("Consolas", 10), state="disabled", bg="#1E1E1E", fg="#D4D4D4")
+        self.txt_hex_display.pack(fill="both", expand=True, padx=5, pady=5)
+
+    def load_hex_view_page(self):
+        """ดึงข้อมูลจาก ESP32 มาแสดงตาราง Hex บนหน้า Hex Viewer"""
+        addr_str = f"0x{self.current_hex_addr:06X}"
+        self.lbl_hex_page_info.config(text=f"Page: 0x{self.current_hex_addr:06X} - 0x{self.current_hex_addr + self.bytes_per_page - 1:06X}")
+        
+        resp = self.execute_cmd_with_progress(f"READ:{addr_str}:{self.bytes_per_page}", ["DATA:"])
+        if not resp or not resp.startswith("DATA:"):
+            return
+
+        raw_hex_list = resp[5:].strip().split(" ")
+        try:
+            raw_bytes = bytes([int(x, 16) for x in raw_hex_list])
+        except ValueError:
+            return
+
+        lines = []
+        header = "Offset    00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F  Decoded ASCII\n"
+        header += "-" * 77 + "\n"
+        lines.append(header)
+
+        for i in range(0, len(raw_bytes), 16):
+            chunk = raw_bytes[i:i+16]
+            row_addr = f"{self.current_hex_addr + i:08X}"
+            
+            hex_b1 = " ".join(f"{b:02X}" for b in chunk[:8])
+            hex_b2 = " ".join(f"{b:02X}" for b in chunk[8:])
+            
+            hex_part = f"{hex_b1:<23}  {hex_b2:<23}"
+            ascii_part = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
+            
+            lines.append(f"{row_addr}  {hex_part}  |{ascii_part}|")
+
+        self.txt_hex_display.config(state="normal")
+        self.txt_hex_display.delete('1.0', tk.END)
+        self.txt_hex_display.insert(tk.END, "\n".join(lines))
+        self.txt_hex_display.config(state="disabled")
+
+    def cmd_hex_jump(self):
+        try:
+            addr = int(self.ent_hex_jump.get().strip(), 16)
+            addr = addr & ~0xF  # Align 16 ไบต์
+            if 0 <= addr < 0x200000:
+                self.current_hex_addr = addr
+                self.load_hex_view_page()
+            else:
+                messagebox.showerror("Error", "Address out of range (0x000000 - 0x1FFFFF)")
+        except ValueError:
+            messagebox.showerror("Error", "Invalid Hex Address format")
+
+    def cmd_hex_prev(self):
+        if self.current_hex_addr >= self.bytes_per_page:
+            self.current_hex_addr -= self.bytes_per_page
+            self.ent_hex_jump.delete(0, tk.END)
+            self.ent_hex_jump.insert(0, f"0x{self.current_hex_addr:06X}")
+            self.load_hex_view_page()
+
+    def cmd_hex_next(self):
+        if self.current_hex_addr + self.bytes_per_page < 0x200000:
+            self.current_hex_addr += self.bytes_per_page
+            self.ent_hex_jump.delete(0, tk.END)
+            self.ent_hex_jump.insert(0, f"0x{self.current_hex_addr:06X}")
+            self.load_hex_view_page()
 
     def ops_log(self, text):
         self.txt_ops_log.config(state="normal")
@@ -185,7 +271,6 @@ class FlashProgrammerGUI:
             self.port_cb.current(0)
 
     def on_freq_changed(self, event=None):
-        """ส่งคำสั่งตั้งค่าความถี่ SPI ไปยัง ESP32"""
         if self.ser and self.ser.is_open:
             freq_str = self.freq_cb.get().split(" ")[0]
             resp = self.send_raw_cmd(f"SET_FREQ:{freq_str}")
@@ -203,21 +288,19 @@ class FlashProgrammerGUI:
                 messagebox.showerror("Error", "No COM Port selected!")
                 return
             try:
-                self.ser = serial.Serial(port, 115200, timeout=3)
+                # ปรับ Baud Rate เป็น 921,600 bps
+                self.ser = serial.Serial(port, 921600, timeout=3)
                 self.ser.dtr = False
                 self.ser.rts = False
                 time.sleep(1.8)
                 self.ser.reset_input_buffer()
                 self.set_led_status(True)
-                
-                # ส่งความถี่ SPI ปัจจุบันไปตั้งค่าที่ ESP32
                 self.on_freq_changed()
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to connect: {e}")
                 self.set_led_status(False)
 
     def send_raw_cmd(self, command):
-        """ส่งคำสั่งเดี่ยวสั้นๆ"""
         try:
             self.ser.reset_input_buffer()
             self.ser.write((command + "\n").encode('utf-8'))
@@ -226,7 +309,6 @@ class FlashProgrammerGUI:
             return None
 
     def execute_cmd_with_progress(self, command, expected_end_tokens, timeout=45.0):
-        """ฟังก์ชันส่วนกลางสำหรับประมวลผลคำสั่งและรับ Progress 0-100%"""
         if not self.ser or not self.ser.is_open:
             messagebox.showwarning("Warning", "Please connect to COM Port first!")
             return None
@@ -313,7 +395,6 @@ class FlashProgrammerGUI:
             self.ops_log(f"[FAIL] Erase failed: {resp}")
 
     def cmd_erase_chip(self):
-        """2. ฟังก์ชันลบทั้งชิป (Chip Erase)"""
         if not messagebox.askyesno("Confirm Erase", "Are you sure you want to erase ENTIRE CHIP (2MB)?"):
             return
         self.ops_log("[ACTION] Erasing ENTIRE CHIP (2 Megabytes)... Please wait...")

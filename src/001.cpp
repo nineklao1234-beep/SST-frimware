@@ -88,7 +88,6 @@ void writePattern(uint32_t addr, uint32_t len, int patternType) {
     digitalWrite(CS_PIN, HIGH);
     SPI.endTransaction();
     
-    // รอ Busy ในแต่ละ Page
     uint8_t status;
     do {
       SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
@@ -97,7 +96,7 @@ void writePattern(uint32_t addr, uint32_t len, int patternType) {
       status = SPI.transfer(0x00);
       digitalWrite(CS_PIN, HIGH);
       SPI.endTransaction();
-      delayMicroseconds(100);
+      delayMicroseconds(50);
     } while (status & 0x01);
 
     bytesWritten += chunkSize;
@@ -311,7 +310,7 @@ void processCommand(String cmd) {
     uint32_t addr = strtoul(cmd.substring(5, idx).c_str(), NULL, 16);
     int len = cmd.substring(idx + 1).toInt();
     if (len <= 0) len = 16;
-    if (len > 256) len = 256;
+    if (len > 512) len = 512;
 
     Serial.println("PROGRESS:0");
     SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
@@ -335,7 +334,8 @@ void processCommand(String cmd) {
 }
 
 void setup() {
-  Serial.begin(115200);
+  // สั่งเปิดความเร็ว Serial Baud Rate ไปที่ 921,600 bps
+  Serial.begin(921600);
   pinMode(CS_PIN, OUTPUT);
   digitalWrite(CS_PIN, HIGH);
   SPI.begin(18, 19, 23, CS_PIN);
