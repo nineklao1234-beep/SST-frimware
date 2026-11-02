@@ -60,7 +60,6 @@ void writeEnable() {
   SPI.endTransaction();
 }
 
-// ฟังก์ชันสร้าง Pattern รองรับแบบสุ่ม และ Custom Byte
 uint8_t getPatternByte(uint32_t offset, int patternType, uint8_t customVal = 0x00) {
   switch (patternType) {
     case 0: return 0xAA;
@@ -68,18 +67,18 @@ uint8_t getPatternByte(uint32_t offset, int patternType, uint8_t customVal = 0x0
     case 2: return (offset % 2 == 0) ? 0xAA : 0x55;
     case 3: return (uint8_t)(offset & 0xFF);
     case 4: return 0x00;
-    case 5: { // Pseudo-Random (Deterministic ตาม offset เพื่อให้เขียนและ Verify ตรงกัน)
+    case 5: { // Pseudo-Random
       uint32_t hash = offset ^ 0x5BF03635;
       hash = (hash ^ (hash >> 16)) * 0x45d9f3b;
       hash = (hash ^ (hash >> 16)) * 0x45d9f3b;
       return (uint8_t)((hash ^ (hash >> 16)) & 0xFF);
     }
-    case 6: return customVal; // Custom Hex Byte
+    case 6: return customVal; // Custom Byte
     default: return 0xFF;
   }
 }
 
-void writePattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVal) {
+bool writePattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVal) {
   uint32_t bytesWritten = 0;
   uint8_t pageBuf[256];
   int lastPct = -1;
@@ -89,7 +88,7 @@ void writePattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVa
   while (bytesWritten < len) {
     if (checkStopCommand()) {
       Serial.println("ABORTED");
-      return;
+      return false;
     }
 
     uint32_t currentAddr = addr + bytesWritten;
@@ -138,10 +137,11 @@ void writePattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVa
   }
   Serial.println("PROGRESS:100");
   Serial.println("WRITE_PAT:OK");
+  return true;
 }
 
-void verifyPattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVal) {
-  uint32_t errors = 0;
+bool verifyPattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVal, uint32_t &outErrors) {
+  outErrors = 0;
   uint32_t firstErrAddr = 0;
   uint8_t expectedErr = 0, actualErr = 0;
   int lastPct = -1;
@@ -160,19 +160,19 @@ void verifyPattern(uint32_t addr, uint32_t len, int patternType, uint8_t customV
       digitalWrite(CS_PIN, HIGH);
       SPI.endTransaction();
       Serial.println("ABORTED");
-      return;
+      return false;
     }
 
     uint8_t actual = SPI.transfer(0x00);
     uint8_t expected = getPatternByte(i, patternType, customVal);
 
     if (actual != expected) {
-      if (errors == 0) {
+      if (outErrors == 0) {
         firstErrAddr = addr + i;
         expectedErr = expected;
         actualErr = actual;
       }
-      errors++;
+      outErrors++;
     }
 
     int currentPct = (int)((uint64_t)(i + 1) * 100 / len);
@@ -186,57 +186,81 @@ void verifyPattern(uint32_t addr, uint32_t len, int patternType, uint8_t customV
   SPI.endTransaction();
 
   Serial.println("PROGRESS:100");
-  if (errors == 0) {
+  if (outErrors == 0) {
     Serial.println("VERIFY:OK");
   } else {
-    Serial.printf("VERIFY:FAIL:%d:0x%06X:EXP_0x%02X_GOT_0x%02X\n", errors, firstErrAddr, expectedErr, actualErr);
+    Serial.printf("VERIFY:FAIL:%d:0x%06X:EXP_0x%02X_GOT_0x%02X\n", outErrors, firstErrAddr, expectedErr, actualErr);
   }
+  return true;
 }
 
-void verifyFullChip(int patternType, uint8_t customVal) {
-  uint32_t totalErrors = 0;
-  const uint32_t maxPrintedErrors = 100;
-  int lastPct = -1;
-
+bool eraseSector(uint32_t addr) {
   Serial.println("PROGRESS:0");
-
+  writeEnable();
   SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
   digitalWrite(CS_PIN, LOW);
-  SPI.transfer(CMD_READ_DATA);
-  SPI.transfer(0x00);
-  SPI.transfer(0x00);
-  SPI.transfer(0x00);
-
-  for (uint32_t i = 0; i < FLASH_SIZE_2MB; i++) {
-    if ((i % 2048 == 0) && checkStopCommand()) {
-      digitalWrite(CS_PIN, HIGH);
-      SPI.endTransaction();
-      Serial.println("ABORTED");
-      return;
-    }
-
-    uint8_t actual = SPI.transfer(0x00);
-    uint8_t expected = getPatternByte(i, patternType, customVal);
-
-    if (actual != expected) {
-      totalErrors++;
-      if (totalErrors <= maxPrintedErrors) {
-        Serial.printf("FAIL_ADDR:0x%06X:EXP_0x%02X_GOT_0x%02X\n", i, expected, actual);
-      }
-    }
-
-    int currentPct = (int)((uint64_t)(i + 1) * 100 / FLASH_SIZE_2MB);
-    int currentStep = (currentPct / 10) * 10;
-    if (currentStep != lastPct) {
-      lastPct = currentStep;
-      Serial.printf("PROGRESS:%d\n", lastPct);
-    }
-  }
+  SPI.transfer(CMD_SECTOR_ERASE);
+  SPI.transfer((addr >> 16) & 0xFF);
+  SPI.transfer((addr >> 8) & 0xFF);
+  SPI.transfer(addr & 0xFF);
   digitalWrite(CS_PIN, HIGH);
   SPI.endTransaction();
+  waitBusyWithProgress();
+  return true;
+}
 
-  Serial.println("PROGRESS:100");
-  Serial.printf("VERIFY_FULL:DONE:%u\n", totalErrors);
+bool eraseChip() {
+  Serial.println("PROGRESS:0");
+  writeEnable();
+  SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
+  digitalWrite(CS_PIN, LOW);
+  SPI.transfer(CMD_CHIP_ERASE);
+  digitalWrite(CS_PIN, HIGH);
+  SPI.endTransaction();
+  waitBusyWithProgress();
+  return true;
+}
+
+void runLoopTest(int scope, uint32_t addr, uint32_t len, int patType, uint8_t customVal) {
+  uint32_t cycle = 1;
+  while (true) {
+    if (checkStopCommand()) {
+      Serial.println("ABORTED");
+      break;
+    }
+
+    Serial.printf("CYCLE_START:%u\n", cycle);
+
+    // --- Phase 1: Erase ---
+    Serial.println("PHASE:ERASE");
+    if (scope == 1) {
+      if (!eraseChip()) break;
+    } else {
+      if (!eraseSector(addr)) break;
+    }
+    if (checkStopCommand()) { Serial.println("ABORTED"); break; }
+
+    // --- Phase 2: Write ---
+    Serial.println("PHASE:WRITE");
+    if (scope == 1) {
+      if (!writePattern(0x000000, FLASH_SIZE_2MB, patType, customVal)) break;
+    } else {
+      if (!writePattern(addr, len, patType, customVal)) break;
+    }
+    if (checkStopCommand()) { Serial.println("ABORTED"); break; }
+
+    // --- Phase 3: Verify ---
+    Serial.println("PHASE:VERIFY");
+    uint32_t errs = 0;
+    if (scope == 1) {
+      if (!verifyPattern(0x000000, FLASH_SIZE_2MB, patType, customVal, errs)) break;
+    } else {
+      if (!verifyPattern(addr, len, patType, customVal, errs)) break;
+    }
+
+    Serial.printf("CYCLE_DONE:%u:%u\n", cycle, errs);
+    cycle++;
+  }
 }
 
 void processCommand(String cmd) {
@@ -297,32 +321,14 @@ void processCommand(String cmd) {
   }
   else if (cmd.startsWith("ERASE:")) {
     uint32_t addr = strtoul(cmd.substring(6).c_str(), NULL, 16);
-    Serial.println("PROGRESS:0");
-    writeEnable();
-    SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
-    digitalWrite(CS_PIN, LOW);
-    SPI.transfer(CMD_SECTOR_ERASE);
-    SPI.transfer((addr >> 16) & 0xFF);
-    SPI.transfer((addr >> 8) & 0xFF);
-    SPI.transfer(addr & 0xFF);
-    digitalWrite(CS_PIN, HIGH);
-    SPI.endTransaction();
-    waitBusyWithProgress();
+    eraseSector(addr);
     Serial.println("ERASE:OK");
   }
   else if (cmd == "ERASE_CHIP") {
-    Serial.println("PROGRESS:0");
-    writeEnable();
-    SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
-    digitalWrite(CS_PIN, LOW);
-    SPI.transfer(CMD_CHIP_ERASE);
-    digitalWrite(CS_PIN, HIGH);
-    SPI.endTransaction();
-    waitBusyWithProgress();
+    eraseChip();
     Serial.println("ERASE_CHIP:OK");
   }
   else if (cmd.startsWith("WRITE_PAT:")) {
-    // Format: WRITE_PAT:<ADDR>:<LEN>:<PAT_TYPE>:<CUSTOM_HEX>
     int p1 = cmd.indexOf(':', 10);
     int p2 = cmd.indexOf(':', p1 + 1);
     int p3 = cmd.indexOf(':', p2 + 1);
@@ -334,7 +340,6 @@ void processCommand(String cmd) {
     writePattern(addr, len, patType, customVal);
   }
   else if (cmd.startsWith("WRITE_FULL_PAT:")) {
-    // Format: WRITE_FULL_PAT:<PAT_TYPE>:<CUSTOM_HEX>
     int p1 = cmd.indexOf(':', 15);
     int patType = cmd.substring(15, p1).toInt();
     uint8_t customVal = (uint8_t)strtoul(cmd.substring(p1 + 1).c_str(), NULL, 16);
@@ -342,7 +347,6 @@ void processCommand(String cmd) {
     writePattern(0x000000, FLASH_SIZE_2MB, patType, customVal);
   }
   else if (cmd.startsWith("VERIFY:")) {
-    // Format: VERIFY:<ADDR>:<LEN>:<PAT_TYPE>:<CUSTOM_HEX>
     int p1 = cmd.indexOf(':', 7);
     int p2 = cmd.indexOf(':', p1 + 1);
     int p3 = cmd.indexOf(':', p2 + 1);
@@ -351,15 +355,32 @@ void processCommand(String cmd) {
     int patType = cmd.substring(p2 + 1, p3).toInt();
     uint8_t customVal = (uint8_t)strtoul(cmd.substring(p3 + 1).c_str(), NULL, 16);
 
-    verifyPattern(addr, len, patType, customVal);
+    uint32_t dummyErrs = 0;
+    verifyPattern(addr, len, patType, customVal, dummyErrs);
   }
   else if (cmd.startsWith("VERIFY_FULL_PAT:")) {
-    // Format: VERIFY_FULL_PAT:<PAT_TYPE>:<CUSTOM_HEX>
     int p1 = cmd.indexOf(':', 16);
     int patType = cmd.substring(16, p1).toInt();
     uint8_t customVal = (uint8_t)strtoul(cmd.substring(p1 + 1).c_str(), NULL, 16);
 
-    verifyFullChip(patType, customVal);
+    uint32_t dummyErrs = 0;
+    verifyPattern(0x000000, FLASH_SIZE_2MB, patType, customVal, dummyErrs);
+  }
+  else if (cmd.startsWith("LOOP_START:")) {
+    // Format: LOOP_START:<SCOPE>:<ADDR>:<LEN>:<PAT_TYPE>:<CUSTOM_HEX>
+    int p1 = cmd.indexOf(':', 11);
+    int p2 = cmd.indexOf(':', p1 + 1);
+    int p3 = cmd.indexOf(':', p2 + 1);
+    int p4 = cmd.indexOf(':', p3 + 1);
+    int p5 = cmd.indexOf(':', p4 + 1);
+
+    int scope = cmd.substring(11, p1).toInt();
+    uint32_t addr = strtoul(cmd.substring(p1 + 1, p2).c_str(), NULL, 16);
+    uint32_t len = cmd.substring(p2 + 1, p3).toInt();
+    int patType = cmd.substring(p3 + 1, p4).toInt();
+    uint8_t customVal = (uint8_t)strtoul(cmd.substring(p4 + 1).c_str(), NULL, 16);
+
+    runLoopTest(scope, addr, len, patType, customVal);
   }
   else if (cmd.startsWith("READ:")) {
     int idx = cmd.indexOf(':', 5);

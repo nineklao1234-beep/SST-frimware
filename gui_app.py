@@ -8,7 +8,7 @@ class FlashProgrammerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("SST26VF016B Tester & Programmer - ESP32")
-        self.root.geometry("860x600")
+        self.root.geometry("900x660")
         self.root.resizable(False, False)
         
         self.ser = None
@@ -19,36 +19,39 @@ class FlashProgrammerGUI:
         style = ttk.Style()
         style.theme_use('clam')
 
-        # --- Top Connection & System Bar ---
-        top_bar = ttk.LabelFrame(root, text=" Connection & Configuration ")
+        # =========================================================================
+        # TOP HEADER: Serial Connection, Status & Loop Phase Display
+        # =========================================================================
+        top_bar = ttk.LabelFrame(root, text=" System Control & Device Status ")
         top_bar.pack(fill="x", padx=10, pady=5)
 
-        ttk.Label(top_bar, text="Port:").grid(row=0, column=0, padx=(5,2), pady=8)
+        # --- Row 0: Serial Connection & Speed & Progress & Phase Status ---
+        ttk.Label(top_bar, text="Port:").grid(row=0, column=0, padx=(5,2), pady=4, sticky="e")
         self.port_cb = ttk.Combobox(top_bar, width=10, state="readonly")
-        self.port_cb.grid(row=0, column=1, padx=2, pady=8)
+        self.port_cb.grid(row=0, column=1, padx=2, pady=4)
         
         btn_refresh = ttk.Button(top_bar, text="Refresh", command=self.refresh_ports)
-        btn_refresh.grid(row=0, column=2, padx=2, pady=8)
+        btn_refresh.grid(row=0, column=2, padx=2, pady=4)
 
         self.btn_connect = ttk.Button(top_bar, text="Connect", command=self.toggle_connection)
-        self.btn_connect.grid(row=0, column=3, padx=2, pady=8)
+        self.btn_connect.grid(row=0, column=3, padx=2, pady=4)
 
         self.led_canvas = tk.Canvas(top_bar, width=18, height=18, highlightthickness=0)
-        self.led_canvas.grid(row=0, column=4, padx=(8, 2), pady=8)
+        self.led_canvas.grid(row=0, column=4, padx=(8, 2), pady=4)
         self.led_circle = self.led_canvas.create_oval(2, 2, 16, 16, fill="#FF3B30", outline="#B30000")
 
         self.lbl_status = ttk.Label(top_bar, text="Disconnected", font=("Segoe UI", 9, "bold"), foreground="#FF3B30")
-        self.lbl_status.grid(row=0, column=5, padx=(2, 8), pady=8)
+        self.lbl_status.grid(row=0, column=5, padx=(2, 8), pady=4)
 
-        ttk.Label(top_bar, text="SPI Speed:").grid(row=0, column=6, padx=(5, 2), pady=8)
+        ttk.Label(top_bar, text="SPI Speed:").grid(row=0, column=6, padx=(5, 2), pady=4, sticky="e")
         self.freq_cb = ttk.Combobox(top_bar, width=8, state="readonly")
         self.freq_cb['values'] = ["1 MHz", "5 MHz", "10 MHz", "20 MHz", "40 MHz"]
         self.freq_cb.current(2)
-        self.freq_cb.grid(row=0, column=7, padx=2, pady=8)
+        self.freq_cb.grid(row=0, column=7, padx=2, pady=4)
         self.freq_cb.bind("<<ComboboxSelected>>", self.on_freq_changed)
 
         prog_frame = ttk.Frame(top_bar)
-        prog_frame.grid(row=0, column=8, padx=(10, 5), pady=8, sticky="e")
+        prog_frame.grid(row=0, column=8, padx=(10, 5), pady=4, sticky="e")
         top_bar.grid_columnconfigure(8, weight=1)
 
         self.progress_var = tk.DoubleVar()
@@ -61,26 +64,51 @@ class FlashProgrammerGUI:
         btn_stop = tk.Button(prog_frame, text="⛔ STOP", command=self.cmd_stop, bg="#FF3B30", fg="white", font=("Segoe UI", 8, "bold"), relief="flat", padx=6)
         btn_stop.pack(side="left", padx=(5, 2))
 
-        # --- Tab System ---
+        # --- Row 1: Integrated Status & Phase Indicators ---
+        dev_ctrl_frame = ttk.Frame(top_bar)
+        dev_ctrl_frame.grid(row=1, column=0, columnspan=9, padx=5, pady=(2, 6), sticky="we")
+
+        ttk.Button(dev_ctrl_frame, text="Read JEDEC ID", command=self.cmd_read_id).pack(side="left", padx=3)
+        ttk.Button(dev_ctrl_frame, text="Unlock Protection", command=self.cmd_unlock).pack(side="left", padx=3)
+        ttk.Button(dev_ctrl_frame, text="Read Registers", command=self.cmd_read_regs).pack(side="left", padx=3)
+
+        self.lbl_jedec = ttk.Label(dev_ctrl_frame, text="JEDEC ID: -- -- --", font=("Consolas", 9, "bold"))
+        self.lbl_jedec.pack(side="left", padx=(10, 8))
+
+        self.lbl_stat_reg = ttk.Label(dev_ctrl_frame, text="SR(0x05): --", font=("Consolas", 9))
+        self.lbl_stat_reg.pack(side="left", padx=5)
+
+        self.lbl_cfg_reg = ttk.Label(dev_ctrl_frame, text="CR(0x35): --", font=("Consolas", 9))
+        self.lbl_cfg_reg.pack(side="left", padx=5)
+
+        # Status Phase Label
+        self.lbl_phase = ttk.Label(dev_ctrl_frame, text="[ State: IDLE | Cycle: 0 ]", font=("Consolas", 9, "bold"), foreground="#007ACC")
+        self.lbl_phase.pack(side="right", padx=(5, 10))
+
+        # =========================================================================
+        # TAB SYSTEM
+        # =========================================================================
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=5)
 
-        # Tab 1: Status & Info
-        self.tab_status = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_status, text=" 📊 Device Status ")
-        self.setup_tab_status()
-
-        # Tab 2: Memory Operations (จัดระเบียบใหม่ด้วย Dropdown)
+        # Tab 1: Memory Operations
         self.tab_ops = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_ops, text=" ⚡ Memory Operations ")
         self.setup_tab_ops()
 
-        # Tab 3: Hex Viewer (ระบบคลิกกดโหลดหน้า)
+        # Tab 2: Hex Viewer
         self.tab_hex = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_hex, text=" 🔍 Hex Viewer ")
         self.setup_tab_hex()
 
         self.refresh_ports()
+
+    # -------------------------------------------------------------------------
+    # Core Communication & Control Helpers
+    # -------------------------------------------------------------------------
+    def update_phase_status(self, text):
+        self.lbl_phase.config(text=text)
+        self.root.update_idletasks()
 
     def cmd_stop(self):
         self.stop_requested = True
@@ -106,52 +134,31 @@ class FlashProgrammerGUI:
             self.lbl_status.config(text="Disconnected", foreground="#FF3B30")
             self.btn_connect.config(text="Connect")
             self.update_progress(0)
+            self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
 
-    def setup_tab_status(self):
-        dev_frame = ttk.LabelFrame(self.tab_status, text=" Device Control ")
-        dev_frame.pack(fill="x", padx=10, pady=10)
-
-        ttk.Button(dev_frame, text="Read JEDEC ID", command=self.cmd_read_id).grid(row=0, column=0, padx=10, pady=10)
-        ttk.Button(dev_frame, text="Global Protection Unlock", command=self.cmd_unlock).grid(row=0, column=1, padx=10, pady=10)
-        
-        self.lbl_jedec = ttk.Label(dev_frame, text="JEDEC ID: -- -- --", font=("Consolas", 10, "bold"))
-        self.lbl_jedec.grid(row=0, column=2, padx=15, pady=10)
-
-        reg_frame = ttk.LabelFrame(self.tab_status, text=" Register Status ")
-        reg_frame.pack(fill="x", padx=10, pady=5)
-
-        ttk.Button(reg_frame, text="Read Registers", command=self.cmd_read_regs).grid(row=0, column=0, padx=10, pady=10)
-
-        reg_info_frame = ttk.Frame(reg_frame)
-        reg_info_frame.grid(row=0, column=1, padx=15, pady=5, sticky="w")
-
-        self.lbl_stat_reg = ttk.Label(reg_info_frame, text="Status Reg (0x05): --  [ BUSY: - | WEL: - ]", font=("Consolas", 9))
-        self.lbl_stat_reg.pack(anchor="w", pady=2)
-
-        self.lbl_cfg_reg = ttk.Label(reg_info_frame, text="Config Reg (0x35): --  [ IOC: - | BPNV: - ]", font=("Consolas", 9))
-        self.lbl_cfg_reg.pack(anchor="w", pady=2)
-
+    # -------------------------------------------------------------------------
+    # Tab 1: Memory Operations
+    # -------------------------------------------------------------------------
     def setup_tab_ops(self):
-        """จัดระเบียบหน้า Test Configuration ใหม่ให้อยู่ในระเบียบ"""
         cfg_frame = ttk.LabelFrame(self.tab_ops, text=" Execution & Pattern Parameters ")
         cfg_frame.pack(fill="x", padx=10, pady=5)
 
-        # Row 0: Action Mode Dropdown & Scope Selection
+        # Row 0: Operation Mode & Scope
         ttk.Label(cfg_frame, text="Operation Mode:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
         self.op_mode_cb = ttk.Combobox(cfg_frame, width=22, state="readonly")
         self.op_mode_cb['values'] = [
             "✍️ Write Pattern",
             "🔍 Verify Pattern",
             "🗑️ Erase Sector (4KB)",
-            "💥 Erase Full Chip (2MB)",
-            "📖 Read Data (Hex)"
+            "📖 Read Data (Hex)",
+            "🔁 Loop Test (EMC)"
         ]
         self.op_mode_cb.current(0)
         self.op_mode_cb.grid(row=0, column=1, padx=5, pady=5)
         self.op_mode_cb.bind("<<ComboboxSelected>>", self.on_op_mode_changed)
 
         ttk.Label(cfg_frame, text="Scope:").grid(row=0, column=2, padx=5, pady=5, sticky="e")
-        self.scope_cb = ttk.Combobox(cfg_frame, width=16, state="readonly")
+        self.scope_cb = ttk.Combobox(cfg_frame, width=18, state="readonly")
         self.scope_cb['values'] = ["Selected Range", "Entire Chip (2MB)"]
         self.scope_cb.current(0)
         self.scope_cb.grid(row=0, column=3, padx=5, pady=5)
@@ -167,7 +174,7 @@ class FlashProgrammerGUI:
         self.ent_len.insert(0, "4096")
         self.ent_len.grid(row=1, column=3, padx=5, pady=5)
 
-        # Row 2: Pattern Select & Custom Byte Input
+        # Row 2: Pattern Selection & Custom Hex
         ttk.Label(cfg_frame, text="Pattern Type:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
         self.pat_cb = ttk.Combobox(cfg_frame, width=22, state="readonly")
         self.pat_cb['values'] = [
@@ -176,8 +183,8 @@ class FlashProgrammerGUI:
             "2: Alt 0xAA / 0x55",
             "3: Inc (0x00-0xFF)",
             "4: All 0x00",
-            "5: 🎲 Pseudo-Random (สุ่ม)",
-            "6: ✏️ Custom Hex (กำหนดเอง)"
+            "5: 🎲 Pseudo-Random",
+            "6: ✏️ Custom Hex"
         ]
         self.pat_cb.current(0)
         self.pat_cb.grid(row=2, column=1, padx=5, pady=5)
@@ -192,13 +199,16 @@ class FlashProgrammerGUI:
         act_frame = ttk.Frame(self.tab_ops)
         act_frame.pack(fill="x", padx=10, pady=5)
 
-        btn_exec = ttk.Button(act_frame, text="▶ ดำเนินการ (Execute Operation)", command=self.cmd_execute_action)
+        btn_exec = ttk.Button(act_frame, text="▶ Execute Operation", command=self.cmd_execute_action)
         btn_exec.pack(side="left", padx=5)
+
+        btn_chip_erase = ttk.Button(act_frame, text="💥 Erase Full Chip (2MB)", command=self.cmd_standalone_erase_chip)
+        btn_chip_erase.pack(side="left", padx=5)
 
         btn_clear = ttk.Button(act_frame, text="🧹 Clear Log", command=self.cmd_clear_log)
         btn_clear.pack(side="right", padx=5)
 
-        # Output Log Box
+        # Log Output Frame
         log_frame = ttk.LabelFrame(self.tab_ops, text=" Operation Log ")
         log_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
@@ -207,9 +217,7 @@ class FlashProgrammerGUI:
 
     def on_op_mode_changed(self, event=None):
         mode = self.op_mode_cb.get()
-        if "Full Chip" in mode or "Sector" in mode:
-            if "Full Chip" in mode:
-                self.scope_cb.set("Entire Chip (2MB)")
+        if "Sector" in mode:
             self.ent_len.config(state="disabled")
         else:
             self.ent_len.config(state="normal")
@@ -221,8 +229,10 @@ class FlashProgrammerGUI:
         else:
             self.ent_custom_hex.config(state="disabled")
 
+    # -------------------------------------------------------------------------
+    # Tab 2: Hex Viewer
+    # -------------------------------------------------------------------------
     def setup_tab_hex(self):
-        """ระบบ Hex Viewer ที่เปลี่ยนหน้าเฉพาะตัวเลข และต้องกดปุ่มเพื่อโหลดข้อมูล"""
         nav_frame = ttk.LabelFrame(self.tab_hex, text=" Navigation & Page Selection ")
         nav_frame.pack(fill="x", padx=10, pady=5)
 
@@ -234,8 +244,7 @@ class FlashProgrammerGUI:
         ttk.Button(nav_frame, text="◀ Prev Page", command=self.cmd_hex_prev_page).grid(row=0, column=2, padx=5, pady=5)
         ttk.Button(nav_frame, text="Next Page ▶", command=self.cmd_hex_next_page).grid(row=0, column=3, padx=5, pady=5)
         
-        # ปุ่มกดโหลดหน้า (โหลดเมื่อผู้ใช้กดเท่านั้น)
-        btn_load_hex = ttk.Button(nav_frame, text="📥 โหลดข้อมูล (Load Page)", command=self.load_hex_view_page)
+        btn_load_hex = ttk.Button(nav_frame, text="📥 Load Page", command=self.load_hex_view_page)
         btn_load_hex.grid(row=0, column=4, padx=10, pady=5)
 
         self.lbl_hex_page_info = ttk.Label(nav_frame, text="Target Page: 0x000000 - 0x0000FF", font=("Consolas", 9, "bold"))
@@ -265,7 +274,6 @@ class FlashProgrammerGUI:
             self.update_hex_page_label()
 
     def load_hex_view_page(self):
-        """โหลดข้อมูลอ่านเฉพาะตอนกดปุ่มเท่านั้น"""
         try:
             addr = int(self.ent_hex_jump.get().strip(), 16)
             addr = addr & ~0xF
@@ -312,6 +320,9 @@ class FlashProgrammerGUI:
         self.txt_hex_display.insert(tk.END, "\n".join(lines))
         self.txt_hex_display.config(state="disabled")
 
+    # -------------------------------------------------------------------------
+    # Utilities & Handlers
+    # -------------------------------------------------------------------------
     def ops_log(self, text):
         self.txt_ops_log.config(state="normal")
         self.txt_ops_log.insert(tk.END, text + "\n")
@@ -389,6 +400,7 @@ class FlashProgrammerGUI:
                     self.ser.write(b"STOP\n")
                     self.ops_log("[ABORTED] Operation stopped by user!")
                     self.update_progress(0)
+                    self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
                     break
 
                 if time.time() - start_time > timeout:
@@ -416,6 +428,7 @@ class FlashProgrammerGUI:
                 elif line == "ABORTED":
                     self.ops_log("[ABORTED] Hardware operation canceled.")
                     self.update_progress(0)
+                    self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
                     break
                 else:
                     for token in expected_end_tokens:
@@ -440,8 +453,89 @@ class FlashProgrammerGUI:
         except ValueError:
             return "00"
 
+    # -------------------------------------------------------------------------
+    # Loop Test Runner (EMC / Emissions Test Engine)
+    # -------------------------------------------------------------------------
+    def run_loop_test_engine(self):
+        """State Machine ประมวลผล Loop Test สตรีมข้อมูลต่อเนื่อง"""
+        if not self.ser or not self.ser.is_open:
+            messagebox.showwarning("Warning", "Please connect to COM Port first!")
+            return
+
+        scope_idx = 1 if self.scope_cb.get() == "Entire Chip (2MB)" else 0
+        addr = self.ent_addr.get().strip()
+        length = self.ent_len.get().strip()
+        pat_idx = self.pat_cb.get().split(":")[0]
+        custom_hex = self.get_custom_hex_val()
+
+        self.stop_requested = False
+        cmd = f"LOOP_START:{scope_idx}:{addr}:{length}:{pat_idx}:{custom_hex}"
+        
+        self.ops_log(f"[LOOP TEST STARTED] Pattern #{pat_idx} | Scope: {self.scope_cb.get()}")
+        self.ser.reset_input_buffer()
+        self.ser.write((cmd + "\n").encode('utf-8'))
+
+        current_cycle = 0
+        current_phase = "IDLE"
+        printed_errors = 0
+
+        while not self.stop_requested:
+            line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+            if not line:
+                continue
+
+            if line.startswith("CYCLE_START:"):
+                current_cycle = int(line.split(":")[1])
+                printed_errors = 0
+                self.update_phase_status(f"[ Cycle #{current_cycle} | Phase: START ]")
+                self.ops_log(f"\n--- Starting Cycle #{current_cycle} ---")
+
+            elif line.startswith("PHASE:"):
+                current_phase = line.split(":")[1]
+                self.update_phase_status(f"[ Cycle #{current_cycle} | Phase: {current_phase} ]")
+                self.ops_log(f" -> Phase: {current_phase}...")
+
+            elif line.startswith("PROGRESS:"):
+                try:
+                    pct = int(line.split(":")[1])
+                    self.update_progress(pct)
+                except ValueError:
+                    pass
+
+            elif line.startswith("FAIL_ADDR:"):
+                printed_errors += 1
+                if printed_errors <= 20:
+                    parts = line.split(":")
+                    self.ops_log(f"  ❌ Mismatch @ {parts[1]} | Details: {parts[2]}")
+
+            elif line.startswith("CYCLE_DONE:"):
+                parts = line.split(":")
+                c_num, c_errs = parts[1], int(parts[2])
+                if c_errs == 0:
+                    self.ops_log(f"🟢 [Cycle #{c_num} PASSED] Total Mismatches: 0")
+                else:
+                    self.ops_log(f"🔴 [Cycle #{c_num} FAILED] Total Mismatches: {c_errs:,}")
+
+            elif line == "ABORTED":
+                self.ops_log("[ABORTED] Loop test canceled by user.")
+                break
+
+        self.update_progress(0)
+        self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
+
+    # -------------------------------------------------------------------------
+    # Actions Dispatcher
+    # -------------------------------------------------------------------------
+    def cmd_standalone_erase_chip(self):
+        if messagebox.askyesno("Confirm Chip Erase", "Are you sure you want to erase the ENTIRE CHIP (2MB)?"):
+            self.update_phase_status("[ Phase: ERASING CHIP... ]")
+            self.ops_log("[ACTION] Erasing ENTIRE CHIP (2 Megabytes)... Please wait...")
+            resp = self.execute_cmd_with_progress("ERASE_CHIP", ["ERASE_CHIP:OK"])
+            if resp == "ERASE_CHIP:OK":
+                self.ops_log("[SUCCESS] 💥 Entire Chip Erased Successfully!")
+            self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
+
     def cmd_execute_action(self):
-        """ประมวลผลตาม Operation Mode และ Scope ที่เลือก"""
         mode = self.op_mode_cb.get()
         scope = self.scope_cb.get()
         addr = self.ent_addr.get().strip()
@@ -449,7 +543,11 @@ class FlashProgrammerGUI:
         pat_idx = self.pat_cb.get().split(":")[0]
         custom_hex = self.get_custom_hex_val()
 
-        if "Write Pattern" in mode:
+        if "Loop Test" in mode:
+            self.run_loop_test_engine()
+
+        elif "Write Pattern" in mode:
+            self.update_phase_status("[ Phase: WRITING... ]")
             if scope == "Entire Chip (2MB)":
                 self.ops_log(f"[ACTION] Writing Pattern #{pat_idx} (Custom: 0x{custom_hex}) to ENTIRE CHIP (2MB)...")
                 t0 = time.time()
@@ -464,19 +562,20 @@ class FlashProgrammerGUI:
                 t1 = time.time()
                 if resp == "WRITE_PAT:OK":
                     self.ops_log(f"[SUCCESS] Pattern Written in {t1-t0:.3f}s!")
+            self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
 
         elif "Verify Pattern" in mode:
+            self.update_phase_status("[ Phase: VERIFYING... ]")
             if scope == "Entire Chip (2MB)":
                 self.ops_log(f"[ACTION] Verifying ENTIRE CHIP with Pattern #{pat_idx}...")
                 t0 = time.time()
-                resp = self.execute_cmd_with_progress(f"VERIFY_FULL_PAT:{pat_idx}:{custom_hex}", ["VERIFY_FULL:DONE:"])
+                resp = self.execute_cmd_with_progress(f"VERIFY_FULL_PAT:{pat_idx}:{custom_hex}", ["VERIFY:OK", "VERIFY:FAIL:"])
                 t1 = time.time()
-                if resp and resp.startswith("VERIFY_FULL:DONE:"):
-                    total_errors = int(resp.split(":")[2])
-                    if total_errors == 0:
-                        self.ops_log(f"[PASSED] 🟢 Full Chip Verification PASSED in {t1-t0:.2f}s!")
-                    else:
-                        self.ops_log(f"[FAILED] 🔴 Full Chip Verification FAILED! Total {total_errors:,} Mismatched Bytes.")
+                if resp == "VERIFY:OK":
+                    self.ops_log(f"[PASSED] 🟢 Full Chip Verification PASSED in {t1-t0:.2f}s!")
+                elif resp and resp.startswith("VERIFY:FAIL:"):
+                    parts = resp.split(":")
+                    self.ops_log(f"[FAILED] 🔴 Full Chip Verification FAILED! ({parts[2]} errors). First Mismatch @ {parts[3]}")
             else:
                 self.ops_log(f"[ACTION] Verifying Pattern #{pat_idx} at {addr} (Len: {length} bytes)...")
                 t0 = time.time()
@@ -487,24 +586,22 @@ class FlashProgrammerGUI:
                 elif resp and resp.startswith("VERIFY:FAIL:"):
                     parts = resp.split(":")
                     self.ops_log(f"[FAILED] 🔴 Verification FAILED! ({parts[2]} errors). First Mismatch @ {parts[3]} [{parts[4]}]")
+            self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
 
         elif "Erase Sector" in mode:
+            self.update_phase_status("[ Phase: ERASING... ]")
             self.ops_log(f"[ACTION] Erasing Sector at {addr}...")
             resp = self.execute_cmd_with_progress(f"ERASE:{addr}", ["ERASE:OK"])
             if resp == "ERASE:OK":
                 self.ops_log(f"[SUCCESS] Sector {addr} Erased.")
-
-        elif "Erase Full Chip" in mode:
-            if messagebox.askyesno("Confirm Erase", "Are you sure you want to erase ENTIRE CHIP (2MB)?"):
-                self.ops_log("[ACTION] Erasing ENTIRE CHIP (2 Megabytes)... Please wait...")
-                resp = self.execute_cmd_with_progress("ERASE_CHIP", ["ERASE_CHIP:OK"])
-                if resp == "ERASE_CHIP:OK":
-                    self.ops_log("[SUCCESS] 💥 Entire Chip Erased Successfully!")
+            self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
 
         elif "Read Data" in mode:
+            self.update_phase_status("[ Phase: READING... ]")
             resp = self.execute_cmd_with_progress(f"READ:{addr}:{length}", ["DATA:"])
             if resp and resp.startswith("DATA:"):
                 self.ops_log(f"[READ @ {addr}] {resp[5:]}")
+            self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
 
     def cmd_read_id(self):
         resp = self.execute_cmd_with_progress("READ_ID", ["ID:"])
@@ -529,8 +626,8 @@ class FlashProgrammerGUI:
             stat_val, cfg_val = int(stat_hex, 16), int(cfg_hex, 16)
             busy, wel = (stat_val >> 0) & 1, (stat_val >> 1) & 1
             ioc, bpnv = (cfg_val >> 1) & 1, (cfg_val >> 3) & 1
-            self.lbl_stat_reg.config(text=f"Status Reg (0x05): 0x{stat_hex}  [ BUSY: {busy} | WEL: {wel} ]")
-            self.lbl_cfg_reg.config(text=f"Config Reg (0x35): 0x{cfg_hex}  [ IOC: {ioc} | BPNV: {bpnv} ]")
+            self.lbl_stat_reg.config(text=f"SR(0x05): 0x{stat_hex}")
+            self.lbl_cfg_reg.config(text=f"CR(0x35): 0x{cfg_hex}")
         else:
             messagebox.showerror("Error", "Failed to read registers")
 
