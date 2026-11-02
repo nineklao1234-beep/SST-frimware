@@ -8,7 +8,7 @@ class FlashProgrammerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("SST26VF016B Tester & Programmer - ESP32")
-        self.root.geometry("900x660")
+        self.root.geometry("920x660")
         self.root.resizable(False, False)
         
         self.ser = None
@@ -25,7 +25,6 @@ class FlashProgrammerGUI:
         top_bar = ttk.LabelFrame(root, text=" System Control & Device Status ")
         top_bar.pack(fill="x", padx=10, pady=5)
 
-        # --- Row 0: Serial Connection & Speed & Progress & Phase Status ---
         ttk.Label(top_bar, text="Port:").grid(row=0, column=0, padx=(5,2), pady=4, sticky="e")
         self.port_cb = ttk.Combobox(top_bar, width=10, state="readonly")
         self.port_cb.grid(row=0, column=1, padx=2, pady=4)
@@ -64,7 +63,7 @@ class FlashProgrammerGUI:
         btn_stop = tk.Button(prog_frame, text="⛔ STOP", command=self.cmd_stop, bg="#FF3B30", fg="white", font=("Segoe UI", 8, "bold"), relief="flat", padx=6)
         btn_stop.pack(side="left", padx=(5, 2))
 
-        # --- Row 1: Integrated Status & Phase Indicators ---
+        # Integrated Status & Phase Indicators
         dev_ctrl_frame = ttk.Frame(top_bar)
         dev_ctrl_frame.grid(row=1, column=0, columnspan=9, padx=5, pady=(2, 6), sticky="we")
 
@@ -81,8 +80,7 @@ class FlashProgrammerGUI:
         self.lbl_cfg_reg = ttk.Label(dev_ctrl_frame, text="CR(0x35): --", font=("Consolas", 9))
         self.lbl_cfg_reg.pack(side="left", padx=5)
 
-        # Status Phase Label
-        self.lbl_phase = ttk.Label(dev_ctrl_frame, text="[ State: IDLE | Cycle: 0 ]", font=("Consolas", 9, "bold"), foreground="#007ACC")
+        self.lbl_phase = ttk.Label(dev_ctrl_frame, text="[ State: IDLE ]", font=("Consolas", 9, "bold"), foreground="#007ACC")
         self.lbl_phase.pack(side="right", padx=(5, 10))
 
         # =========================================================================
@@ -91,21 +89,18 @@ class FlashProgrammerGUI:
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=5)
 
-        # Tab 1: Memory Operations
+        # Tab 1: Memory Operations & Operation Log
         self.tab_ops = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_ops, text=" ⚡ Memory Operations ")
         self.setup_tab_ops()
 
-        # Tab 2: Hex Viewer
+        # Tab 2: Dedicated Hex Viewer
         self.tab_hex = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_hex, text=" 🔍 Hex Viewer ")
         self.setup_tab_hex()
 
         self.refresh_ports()
 
-    # -------------------------------------------------------------------------
-    # Core Communication & Control Helpers
-    # -------------------------------------------------------------------------
     def update_phase_status(self, text):
         self.lbl_phase.config(text=text)
         self.root.update_idletasks()
@@ -134,36 +129,34 @@ class FlashProgrammerGUI:
             self.lbl_status.config(text="Disconnected", foreground="#FF3B30")
             self.btn_connect.config(text="Connect")
             self.update_progress(0)
-            self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
+            self.update_phase_status("[ State: IDLE ]")
 
     # -------------------------------------------------------------------------
-    # Tab 1: Memory Operations
+    # Tab 1: Memory Operations & Operation Log
     # -------------------------------------------------------------------------
     def setup_tab_ops(self):
         cfg_frame = ttk.LabelFrame(self.tab_ops, text=" Execution & Pattern Parameters ")
         cfg_frame.pack(fill="x", padx=10, pady=5)
 
-        # Row 0: Operation Mode & Scope
         ttk.Label(cfg_frame, text="Operation Mode:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
-        self.op_mode_cb = ttk.Combobox(cfg_frame, width=22, state="readonly")
+        self.op_mode_cb = ttk.Combobox(cfg_frame, width=24, state="readonly")
         self.op_mode_cb['values'] = [
             "✍️ Write Pattern",
             "🔍 Verify Pattern",
             "🗑️ Erase Sector (4KB)",
             "📖 Read Data (Hex)",
-            "🔁 Loop Test (EMC)"
+            "🚀 All Patterns Sweep (Full Chip)"
         ]
         self.op_mode_cb.current(0)
         self.op_mode_cb.grid(row=0, column=1, padx=5, pady=5)
         self.op_mode_cb.bind("<<ComboboxSelected>>", self.on_op_mode_changed)
 
-        ttk.Label(cfg_frame, text="Scope:").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        ttk.Label(cfg_frame, text="Scope / Loop:").grid(row=0, column=2, padx=5, pady=5, sticky="e")
         self.scope_cb = ttk.Combobox(cfg_frame, width=18, state="readonly")
-        self.scope_cb['values'] = ["Selected Range", "Entire Chip (2MB)"]
+        self.scope_cb['values'] = ["Selected Range", "Entire Chip (2MB)", "Continuous Loop"]
         self.scope_cb.current(0)
         self.scope_cb.grid(row=0, column=3, padx=5, pady=5)
 
-        # Row 1: Address & Length
         ttk.Label(cfg_frame, text="Address (Hex):").grid(row=1, column=0, padx=5, pady=5, sticky="e")
         self.ent_addr = ttk.Entry(cfg_frame, width=12)
         self.ent_addr.insert(0, "0x000000")
@@ -174,9 +167,8 @@ class FlashProgrammerGUI:
         self.ent_len.insert(0, "4096")
         self.ent_len.grid(row=1, column=3, padx=5, pady=5)
 
-        # Row 2: Pattern Selection & Custom Hex
         ttk.Label(cfg_frame, text="Pattern Type:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
-        self.pat_cb = ttk.Combobox(cfg_frame, width=22, state="readonly")
+        self.pat_cb = ttk.Combobox(cfg_frame, width=24, state="readonly")
         self.pat_cb['values'] = [
             "0: All 0xAA",
             "1: All 0x55",
@@ -195,32 +187,38 @@ class FlashProgrammerGUI:
         self.ent_custom_hex.insert(0, "AA")
         self.ent_custom_hex.grid(row=2, column=3, padx=5, pady=5)
 
-        # Action Execution Bar
+        # Action Buttons
         act_frame = ttk.Frame(self.tab_ops)
-        act_frame.pack(fill="x", padx=10, pady=5)
+        act_frame.pack(fill="x", padx=10, pady=4)
 
         btn_exec = ttk.Button(act_frame, text="▶ Execute Operation", command=self.cmd_execute_action)
-        btn_exec.pack(side="left", padx=5)
+        btn_exec.pack(side="left", padx=4)
 
-        btn_chip_erase = ttk.Button(act_frame, text="💥 Erase Full Chip (2MB)", command=self.cmd_standalone_erase_chip)
-        btn_chip_erase.pack(side="left", padx=5)
+        btn_all_pat = ttk.Button(act_frame, text="🔥 Run All Patterns (1-Click Sweep)", command=self.run_all_pattern_sweep_engine)
+        btn_all_pat.pack(side="left", padx=4)
+
+        btn_chip_erase = ttk.Button(act_frame, text="💥 Erase Full Chip", command=self.cmd_standalone_erase_chip)
+        btn_chip_erase.pack(side="left", padx=4)
 
         btn_clear = ttk.Button(act_frame, text="🧹 Clear Log", command=self.cmd_clear_log)
-        btn_clear.pack(side="right", padx=5)
+        btn_clear.pack(side="right", padx=4)
 
-        # Log Output Frame
+        # Operation Log (ย้ายกลับมาไว้ที่เดิมใน Tab 1)
         log_frame = ttk.LabelFrame(self.tab_ops, text=" Operation Log ")
         log_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
-        self.txt_ops_log = scrolledtext.ScrolledText(log_frame, height=10, font=("Consolas", 9), state="disabled")
+        self.txt_ops_log = scrolledtext.ScrolledText(log_frame, font=("Consolas", 9), state="disabled")
         self.txt_ops_log.pack(fill="both", expand=True, padx=5, pady=5)
 
     def on_op_mode_changed(self, event=None):
         mode = self.op_mode_cb.get()
-        if "Sector" in mode:
+        if "Sweep" in mode:
+            self.scope_cb.set("Entire Chip (2MB)")
             self.ent_len.config(state="disabled")
+            self.pat_cb.config(state="disabled")
         else:
             self.ent_len.config(state="normal")
+            self.pat_cb.config(state="readonly")
 
     def on_pattern_changed(self, event=None):
         pat_idx = self.pat_cb.get().split(":")[0]
@@ -230,7 +228,7 @@ class FlashProgrammerGUI:
             self.ent_custom_hex.config(state="disabled")
 
     # -------------------------------------------------------------------------
-    # Tab 2: Hex Viewer
+    # Tab 2: Dedicated Hex Viewer
     # -------------------------------------------------------------------------
     def setup_tab_hex(self):
         nav_frame = ttk.LabelFrame(self.tab_hex, text=" Navigation & Page Selection ")
@@ -320,9 +318,6 @@ class FlashProgrammerGUI:
         self.txt_hex_display.insert(tk.END, "\n".join(lines))
         self.txt_hex_display.config(state="disabled")
 
-    # -------------------------------------------------------------------------
-    # Utilities & Handlers
-    # -------------------------------------------------------------------------
     def ops_log(self, text):
         self.txt_ops_log.config(state="normal")
         self.txt_ops_log.insert(tk.END, text + "\n")
@@ -400,7 +395,7 @@ class FlashProgrammerGUI:
                     self.ser.write(b"STOP\n")
                     self.ops_log("[ABORTED] Operation stopped by user!")
                     self.update_progress(0)
-                    self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
+                    self.update_phase_status("[ State: IDLE ]")
                     break
 
                 if time.time() - start_time > timeout:
@@ -428,7 +423,7 @@ class FlashProgrammerGUI:
                 elif line == "ABORTED":
                     self.ops_log("[ABORTED] Hardware operation canceled.")
                     self.update_progress(0)
-                    self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
+                    self.update_phase_status("[ State: IDLE ]")
                     break
                 else:
                     for token in expected_end_tokens:
@@ -445,38 +440,25 @@ class FlashProgrammerGUI:
             self.set_led_status(False)
             return None
 
-    def get_custom_hex_val(self):
-        val_str = self.ent_custom_hex.get().strip()
-        try:
-            val = int(val_str, 16)
-            return f"{val:02X}"
-        except ValueError:
-            return "00"
-
-    # -------------------------------------------------------------------------
-    # Loop Test Runner (EMC / Emissions Test Engine)
-    # -------------------------------------------------------------------------
-    def run_loop_test_engine(self):
-        """State Machine ประมวลผล Loop Test สตรีมข้อมูลต่อเนื่อง"""
+    def run_all_pattern_sweep_engine(self):
         if not self.ser or not self.ser.is_open:
             messagebox.showwarning("Warning", "Please connect to COM Port first!")
             return
 
-        scope_idx = 1 if self.scope_cb.get() == "Entire Chip (2MB)" else 0
-        addr = self.ent_addr.get().strip()
-        length = self.ent_len.get().strip()
-        pat_idx = self.pat_cb.get().split(":")[0]
-        custom_hex = self.get_custom_hex_val()
-
+        is_loop = 1 if self.scope_cb.get() == "Continuous Loop" else 0
         self.stop_requested = False
-        cmd = f"LOOP_START:{scope_idx}:{addr}:{length}:{pat_idx}:{custom_hex}"
         
-        self.ops_log(f"[LOOP TEST STARTED] Pattern #{pat_idx} | Scope: {self.scope_cb.get()}")
+        self.ops_log(f"\n==========================================")
+        self.ops_log(f"🚀 STARTING ALL-PATTERN FULL-CHIP SWEEP")
+        self.ops_log(f"==========================================")
+        
         self.ser.reset_input_buffer()
-        self.ser.write((cmd + "\n").encode('utf-8'))
+        self.ser.write(f"ALL_PAT_START:{is_loop}\n".encode('utf-8'))
 
-        current_cycle = 0
-        current_phase = "IDLE"
+        pat_names = ["0xAA", "0x55", "Alt 0xAA/0x55", "Inc (0x00-0xFF)", "All 0x00", "Pseudo-Random"]
+        curr_cycle = 1
+        curr_pat = 0
+        curr_phase = "START"
         printed_errors = 0
 
         while not self.stop_requested:
@@ -484,16 +466,21 @@ class FlashProgrammerGUI:
             if not line:
                 continue
 
-            if line.startswith("CYCLE_START:"):
-                current_cycle = int(line.split(":")[1])
+            if line.startswith("SWEEP_CYCLE_START:"):
+                curr_cycle = int(line.split(":")[1])
+                self.ops_log(f"\n🔄 --- Sweep Cycle #{curr_cycle} ---")
+
+            elif line.startswith("PAT_START:"):
+                curr_pat = int(line.split(":")[1])
                 printed_errors = 0
-                self.update_phase_status(f"[ Cycle #{current_cycle} | Phase: START ]")
-                self.ops_log(f"\n--- Starting Cycle #{current_cycle} ---")
+                p_name = pat_names[curr_pat] if curr_pat < len(pat_names) else f"#{curr_pat}"
+                self.ops_log(f"  ▶ Pattern #{curr_pat} ({p_name})...")
+                self.update_phase_status(f"[ Cycle #{curr_cycle} | Pat: #{curr_pat} ]")
 
             elif line.startswith("PHASE:"):
-                current_phase = line.split(":")[1]
-                self.update_phase_status(f"[ Cycle #{current_cycle} | Phase: {current_phase} ]")
-                self.ops_log(f" -> Phase: {current_phase}...")
+                curr_phase = line.split(":")[1]
+                p_name = pat_names[curr_pat] if curr_pat < len(pat_names) else f"#{curr_pat}"
+                self.update_phase_status(f"[ Pat: #{curr_pat} ({p_name}) | Phase: {curr_phase} ]")
 
             elif line.startswith("PROGRESS:"):
                 try:
@@ -506,26 +493,30 @@ class FlashProgrammerGUI:
                 printed_errors += 1
                 if printed_errors <= 20:
                     parts = line.split(":")
-                    self.ops_log(f"  ❌ Mismatch @ {parts[1]} | Details: {parts[2]}")
+                    self.ops_log(f"    ❌ Mismatch @ {parts[1]} | {parts[2]}")
 
-            elif line.startswith("CYCLE_DONE:"):
+            elif line.startswith("PAT_DONE:"):
                 parts = line.split(":")
-                c_num, c_errs = parts[1], int(parts[2])
-                if c_errs == 0:
-                    self.ops_log(f"🟢 [Cycle #{c_num} PASSED] Total Mismatches: 0")
+                pat_id, errs = int(parts[1]), int(parts[2])
+                p_name = pat_names[pat_id] if pat_id < len(pat_names) else f"#{pat_id}"
+                if errs == 0:
+                    self.ops_log(f"  🟢 Pat #{pat_id} ({p_name}) PASSED!")
                 else:
-                    self.ops_log(f"🔴 [Cycle #{c_num} FAILED] Total Mismatches: {c_errs:,}")
+                    self.ops_log(f"  🔴 Pat #{pat_id} ({p_name}) FAILED! Total {errs:,} Errors")
+
+            elif line.startswith("SWEEP_CYCLE_DONE:"):
+                c_num = line.split(":")[1]
+                self.ops_log(f"✅ Sweep Cycle #{c_num} Completed!")
+                if not is_loop:
+                    break
 
             elif line == "ABORTED":
-                self.ops_log("[ABORTED] Loop test canceled by user.")
+                self.ops_log("[ABORTED] Sweep operation canceled by user.")
                 break
 
         self.update_progress(0)
-        self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
+        self.update_phase_status("[ State: IDLE ]")
 
-    # -------------------------------------------------------------------------
-    # Actions Dispatcher
-    # -------------------------------------------------------------------------
     def cmd_standalone_erase_chip(self):
         if messagebox.askyesno("Confirm Chip Erase", "Are you sure you want to erase the ENTIRE CHIP (2MB)?"):
             self.update_phase_status("[ Phase: ERASING CHIP... ]")
@@ -533,23 +524,24 @@ class FlashProgrammerGUI:
             resp = self.execute_cmd_with_progress("ERASE_CHIP", ["ERASE_CHIP:OK"])
             if resp == "ERASE_CHIP:OK":
                 self.ops_log("[SUCCESS] 💥 Entire Chip Erased Successfully!")
-            self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
+            self.update_phase_status("[ State: IDLE ]")
 
     def cmd_execute_action(self):
         mode = self.op_mode_cb.get()
+        if "Sweep" in mode:
+            self.run_all_pattern_sweep_engine()
+            return
+
         scope = self.scope_cb.get()
         addr = self.ent_addr.get().strip()
         length = self.ent_len.get().strip()
         pat_idx = self.pat_cb.get().split(":")[0]
         custom_hex = self.get_custom_hex_val()
 
-        if "Loop Test" in mode:
-            self.run_loop_test_engine()
-
-        elif "Write Pattern" in mode:
+        if "Write Pattern" in mode:
             self.update_phase_status("[ Phase: WRITING... ]")
             if scope == "Entire Chip (2MB)":
-                self.ops_log(f"[ACTION] Writing Pattern #{pat_idx} (Custom: 0x{custom_hex}) to ENTIRE CHIP (2MB)...")
+                self.ops_log(f"[ACTION] Writing Pattern #{pat_idx} to ENTIRE CHIP (2MB)...")
                 t0 = time.time()
                 resp = self.execute_cmd_with_progress(f"WRITE_FULL_PAT:{pat_idx}:{custom_hex}", ["WRITE_PAT:OK"])
                 t1 = time.time()
@@ -562,7 +554,7 @@ class FlashProgrammerGUI:
                 t1 = time.time()
                 if resp == "WRITE_PAT:OK":
                     self.ops_log(f"[SUCCESS] Pattern Written in {t1-t0:.3f}s!")
-            self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
+            self.update_phase_status("[ State: IDLE ]")
 
         elif "Verify Pattern" in mode:
             self.update_phase_status("[ Phase: VERIFYING... ]")
@@ -586,7 +578,7 @@ class FlashProgrammerGUI:
                 elif resp and resp.startswith("VERIFY:FAIL:"):
                     parts = resp.split(":")
                     self.ops_log(f"[FAILED] 🔴 Verification FAILED! ({parts[2]} errors). First Mismatch @ {parts[3]} [{parts[4]}]")
-            self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
+            self.update_phase_status("[ State: IDLE ]")
 
         elif "Erase Sector" in mode:
             self.update_phase_status("[ Phase: ERASING... ]")
@@ -594,14 +586,14 @@ class FlashProgrammerGUI:
             resp = self.execute_cmd_with_progress(f"ERASE:{addr}", ["ERASE:OK"])
             if resp == "ERASE:OK":
                 self.ops_log(f"[SUCCESS] Sector {addr} Erased.")
-            self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
+            self.update_phase_status("[ State: IDLE ]")
 
         elif "Read Data" in mode:
             self.update_phase_status("[ Phase: READING... ]")
             resp = self.execute_cmd_with_progress(f"READ:{addr}:{length}", ["DATA:"])
             if resp and resp.startswith("DATA:"):
                 self.ops_log(f"[READ @ {addr}] {resp[5:]}")
-            self.update_phase_status("[ State: IDLE | Cycle: 0 ]")
+            self.update_phase_status("[ State: IDLE ]")
 
     def cmd_read_id(self):
         resp = self.execute_cmd_with_progress("READ_ID", ["ID:"])

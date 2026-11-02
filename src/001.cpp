@@ -73,7 +73,7 @@ uint8_t getPatternByte(uint32_t offset, int patternType, uint8_t customVal = 0x0
       hash = (hash ^ (hash >> 16)) * 0x45d9f3b;
       return (uint8_t)((hash ^ (hash >> 16)) & 0xFF);
     }
-    case 6: return customVal; // Custom Byte
+    case 6: return customVal;
     default: return 0xFF;
   }
 }
@@ -194,6 +194,18 @@ bool verifyPattern(uint32_t addr, uint32_t len, int patternType, uint8_t customV
   return true;
 }
 
+bool eraseChip() {
+  Serial.println("PROGRESS:0");
+  writeEnable();
+  SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
+  digitalWrite(CS_PIN, LOW);
+  SPI.transfer(CMD_CHIP_ERASE);
+  digitalWrite(CS_PIN, HIGH);
+  SPI.endTransaction();
+  waitBusyWithProgress();
+  return true;
+}
+
 bool eraseSector(uint32_t addr) {
   Serial.println("PROGRESS:0");
   writeEnable();
@@ -209,58 +221,36 @@ bool eraseSector(uint32_t addr) {
   return true;
 }
 
-bool eraseChip() {
-  Serial.println("PROGRESS:0");
-  writeEnable();
-  SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
-  digitalWrite(CS_PIN, LOW);
-  SPI.transfer(CMD_CHIP_ERASE);
-  digitalWrite(CS_PIN, HIGH);
-  SPI.endTransaction();
-  waitBusyWithProgress();
-  return true;
-}
-
-void runLoopTest(int scope, uint32_t addr, uint32_t len, int patType, uint8_t customVal) {
+void runAllPatternSweep(bool isLoop) {
   uint32_t cycle = 1;
-  while (true) {
-    if (checkStopCommand()) {
-      Serial.println("ABORTED");
-      break;
-    }
-
-    Serial.printf("CYCLE_START:%u\n", cycle);
-
-    // --- Phase 1: Erase ---
-    Serial.println("PHASE:ERASE");
-    if (scope == 1) {
-      if (!eraseChip()) break;
-    } else {
-      if (!eraseSector(addr)) break;
-    }
+  do {
     if (checkStopCommand()) { Serial.println("ABORTED"); break; }
+    Serial.printf("SWEEP_CYCLE_START:%u\n", cycle);
 
-    // --- Phase 2: Write ---
-    Serial.println("PHASE:WRITE");
-    if (scope == 1) {
-      if (!writePattern(0x000000, FLASH_SIZE_2MB, patType, customVal)) break;
-    } else {
-      if (!writePattern(addr, len, patType, customVal)) break;
+    for (int pat = 0; pat <= 5; pat++) {
+      if (checkStopCommand()) { Serial.println("ABORTED"); return; }
+      
+      Serial.printf("PAT_START:%d\n", pat);
+
+      // 1. Erase
+      Serial.println("PHASE:ERASE");
+      if (!eraseChip()) return;
+
+      // 2. Write
+      Serial.println("PHASE:WRITE");
+      if (!writePattern(0x000000, FLASH_SIZE_2MB, pat, 0x00)) return;
+
+      // 3. Verify
+      Serial.println("PHASE:VERIFY");
+      uint32_t errs = 0;
+      if (!verifyPattern(0x000000, FLASH_SIZE_2MB, pat, 0x00, errs)) return;
+
+      Serial.printf("PAT_DONE:%d:%u\n", pat, errs);
     }
-    if (checkStopCommand()) { Serial.println("ABORTED"); break; }
 
-    // --- Phase 3: Verify ---
-    Serial.println("PHASE:VERIFY");
-    uint32_t errs = 0;
-    if (scope == 1) {
-      if (!verifyPattern(0x000000, FLASH_SIZE_2MB, patType, customVal, errs)) break;
-    } else {
-      if (!verifyPattern(addr, len, patType, customVal, errs)) break;
-    }
-
-    Serial.printf("CYCLE_DONE:%u:%u\n", cycle, errs);
+    Serial.printf("SWEEP_CYCLE_DONE:%u\n", cycle);
     cycle++;
-  }
+  } while (isLoop);
 }
 
 void processCommand(String cmd) {
@@ -328,6 +318,10 @@ void processCommand(String cmd) {
     eraseChip();
     Serial.println("ERASE_CHIP:OK");
   }
+  else if (cmd.startsWith("ALL_PAT_START:")) {
+    bool isLoop = (cmd.substring(14).toInt() == 1);
+    runAllPatternSweep(isLoop);
+  }
   else if (cmd.startsWith("WRITE_PAT:")) {
     int p1 = cmd.indexOf(':', 10);
     int p2 = cmd.indexOf(':', p1 + 1);
@@ -365,22 +359,6 @@ void processCommand(String cmd) {
 
     uint32_t dummyErrs = 0;
     verifyPattern(0x000000, FLASH_SIZE_2MB, patType, customVal, dummyErrs);
-  }
-  else if (cmd.startsWith("LOOP_START:")) {
-    // Format: LOOP_START:<SCOPE>:<ADDR>:<LEN>:<PAT_TYPE>:<CUSTOM_HEX>
-    int p1 = cmd.indexOf(':', 11);
-    int p2 = cmd.indexOf(':', p1 + 1);
-    int p3 = cmd.indexOf(':', p2 + 1);
-    int p4 = cmd.indexOf(':', p3 + 1);
-    int p5 = cmd.indexOf(':', p4 + 1);
-
-    int scope = cmd.substring(11, p1).toInt();
-    uint32_t addr = strtoul(cmd.substring(p1 + 1, p2).c_str(), NULL, 16);
-    uint32_t len = cmd.substring(p2 + 1, p3).toInt();
-    int patType = cmd.substring(p3 + 1, p4).toInt();
-    uint8_t customVal = (uint8_t)strtoul(cmd.substring(p4 + 1).c_str(), NULL, 16);
-
-    runLoopTest(scope, addr, len, patType, customVal);
   }
   else if (cmd.startsWith("READ:")) {
     int idx = cmd.indexOf(':', 5);
