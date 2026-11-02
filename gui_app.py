@@ -8,7 +8,7 @@ class FlashProgrammerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("SST26VF016B Tester & Programmer - ESP32")
-        self.root.geometry("640x480")
+        self.root.geometry("760x540")
         self.root.resizable(False, False)
         
         self.ser = None
@@ -16,28 +16,50 @@ class FlashProgrammerGUI:
         style = ttk.Style()
         style.theme_use('clam')
 
-        # --- Top Connection Bar ---
-        conn_frame = ttk.LabelFrame(root, text=" Serial Connection ")
-        conn_frame.pack(fill="x", padx=10, pady=5)
+        # --- Top Connection & System Bar ---
+        top_bar = ttk.LabelFrame(root, text=" Connection & Configuration ")
+        top_bar.pack(fill="x", padx=10, pady=5)
 
-        ttk.Label(conn_frame, text="Port:").grid(row=0, column=0, padx=5, pady=5)
-        self.port_cb = ttk.Combobox(conn_frame, width=12, state="readonly")
-        self.port_cb.grid(row=0, column=1, padx=5, pady=5)
+        # Port Selection
+        ttk.Label(top_bar, text="Port:").grid(row=0, column=0, padx=(5,2), pady=8)
+        self.port_cb = ttk.Combobox(top_bar, width=10, state="readonly")
+        self.port_cb.grid(row=0, column=1, padx=2, pady=8)
         
-        btn_refresh = ttk.Button(conn_frame, text="Refresh", command=self.refresh_ports)
-        btn_refresh.grid(row=0, column=2, padx=5, pady=5)
+        btn_refresh = ttk.Button(top_bar, text="Refresh", command=self.refresh_ports)
+        btn_refresh.grid(row=0, column=2, padx=2, pady=8)
 
-        self.btn_connect = ttk.Button(conn_frame, text="Connect", command=self.toggle_connection)
-        self.btn_connect.grid(row=0, column=3, padx=5, pady=5)
+        self.btn_connect = ttk.Button(top_bar, text="Connect", command=self.toggle_connection)
+        self.btn_connect.grid(row=0, column=3, padx=2, pady=8)
 
-        self.led_canvas = tk.Canvas(conn_frame, width=20, height=20, highlightthickness=0)
-        self.led_canvas.grid(row=0, column=4, padx=(15, 2), pady=5)
-        self.led_circle = self.led_canvas.create_oval(3, 3, 17, 17, fill="#FF3B30", outline="#B30000")
+        # LED Indicator
+        self.led_canvas = tk.Canvas(top_bar, width=18, height=18, highlightthickness=0)
+        self.led_canvas.grid(row=0, column=4, padx=(8, 2), pady=8)
+        self.led_circle = self.led_canvas.create_oval(2, 2, 16, 16, fill="#FF3B30", outline="#B30000")
 
-        self.lbl_status = ttk.Label(conn_frame, text="Disconnected", font=("Segoe UI", 9, "bold"), foreground="#FF3B30")
-        self.lbl_status.grid(row=0, column=5, padx=5, pady=5)
+        self.lbl_status = ttk.Label(top_bar, text="Disconnected", font=("Segoe UI", 9, "bold"), foreground="#FF3B30")
+        self.lbl_status.grid(row=0, column=5, padx=(2, 10), pady=8)
 
-        # --- Tab System (Notebook) ---
+        # 3. เลือกความถี่ SPI Frequency Selection
+        ttk.Label(top_bar, text="SPI Speed:").grid(row=0, column=6, padx=(10, 2), pady=8)
+        self.freq_cb = ttk.Combobox(top_bar, width=8, state="readonly")
+        self.freq_cb['values'] = ["1 MHz", "5 MHz", "10 MHz", "20 MHz", "40 MHz"]
+        self.freq_cb.current(2)  # Default 10 MHz
+        self.freq_cb.grid(row=0, column=7, padx=2, pady=8)
+        self.freq_cb.bind("<<ComboboxSelected>>", self.on_freq_changed)
+
+        # 1. แถบความคืบหน้า มุมขวาบน (Progress Bar & %)
+        prog_frame = ttk.Frame(top_bar)
+        prog_frame.grid(row=0, column=8, padx=(15, 8), pady=8, sticky="e")
+        top_bar.grid_columnconfigure(8, weight=1)
+
+        self.progress_var = tk.DoubleVar()
+        self.progressbar = ttk.Progressbar(prog_frame, variable=self.progress_var, maximum=100, length=110)
+        self.progressbar.pack(side="left", padx=2)
+
+        self.lbl_progress = ttk.Label(prog_frame, text="0%", font=("Segoe UI", 9, "bold"), width=5)
+        self.lbl_progress.pack(side="left", padx=2)
+
+        # --- Tab System ---
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=5)
 
@@ -46,12 +68,18 @@ class FlashProgrammerGUI:
         self.notebook.add(self.tab_status, text=" 📊 Device Status ")
         self.setup_tab_status()
 
-        # Tab 2: Memory Operations (ลบ / เขียน / อ่าน / ตรวจ)
+        # Tab 2: Memory Operations
         self.tab_ops = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_ops, text=" ⚡ Memory Operations ")
         self.setup_tab_ops()
 
         self.refresh_ports()
+
+    def update_progress(self, pct):
+        """อัปเดตเปอร์เซ็นต์แบบก้าวทีละ 10%"""
+        self.progress_var.set(pct)
+        self.lbl_progress.config(text=f"{pct}%")
+        self.root.update_idletasks()
 
     def set_led_status(self, connected):
         if connected:
@@ -62,6 +90,7 @@ class FlashProgrammerGUI:
             self.led_canvas.itemconfig(self.led_circle, fill="#FF3B30", outline="#B30000")
             self.lbl_status.config(text="Disconnected", foreground="#FF3B30")
             self.btn_connect.config(text="Connect")
+            self.update_progress(0)
 
     def setup_tab_status(self):
         dev_frame = ttk.LabelFrame(self.tab_status, text=" Device Control ")
@@ -113,17 +142,26 @@ class FlashProgrammerGUI:
         self.pat_cb.current(0)
         self.pat_cb.grid(row=0, column=5, padx=5, pady=5)
 
-        # Action Buttons
-        btn_frame = ttk.Frame(self.tab_ops)
-        btn_frame.pack(fill="x", padx=10, pady=5)
+        # Action Buttons (Row 1: Range Ops)
+        btn_frame1 = ttk.Frame(self.tab_ops)
+        btn_frame1.pack(fill="x", padx=10, pady=2)
 
-        ttk.Button(btn_frame, text="🗑️ 1. Erase Sector", command=self.cmd_erase).grid(row=0, column=0, padx=5, pady=5)
-        ttk.Button(btn_frame, text="✍️ 2. Write Pattern", command=self.cmd_write_pat).grid(row=0, column=1, padx=5, pady=5)
-        ttk.Button(btn_frame, text="🔍 3. Verify Data", command=self.cmd_verify_pat).grid(row=0, column=2, padx=5, pady=5)
-        ttk.Button(btn_frame, text="📖 Read Data (Hex)", command=self.cmd_read_data).grid(row=0, column=3, padx=5, pady=5)
+        ttk.Button(btn_frame1, text="🗑️ Erase Sector", command=self.cmd_erase_sector).grid(row=0, column=0, padx=4, pady=4)
+        ttk.Button(btn_frame1, text="💥 Erase Full Chip (2MB)", command=self.cmd_erase_chip).grid(row=0, column=1, padx=4, pady=4) # 2. ปุ่มลบทั้งชิป
+        ttk.Button(btn_frame1, text="✍️ Write Range Pattern", command=self.cmd_write_pat).grid(row=0, column=2, padx=4, pady=4)
+        ttk.Button(btn_frame1, text="🔍 Verify Range", command=self.cmd_verify_pat).grid(row=0, column=3, padx=4, pady=4)
+
+        # Action Buttons (Row 2: Full Chip & Utilities)
+        btn_frame2 = ttk.Frame(self.tab_ops)
+        btn_frame2.pack(fill="x", padx=10, pady=2)
+
+        ttk.Button(btn_frame2, text="🚀 Write Full Chip (2MB)", command=self.cmd_write_full_chip).grid(row=0, column=0, padx=4, pady=4)
+        ttk.Button(btn_frame2, text="🕵️ Verify Full Chip (Show Fails)", command=self.cmd_verify_full_chip).grid(row=0, column=1, padx=4, pady=4)
+        ttk.Button(btn_frame2, text="📖 Read Data (Hex)", command=self.cmd_read_data).grid(row=0, column=2, padx=4, pady=4)
+        ttk.Button(btn_frame2, text="🧹 Clear Log", command=self.cmd_clear_log).grid(row=0, column=3, padx=4, pady=4)
 
         # Output Log Box
-        log_frame = ttk.LabelFrame(self.tab_ops, text=" Operation Log / Read Result ")
+        log_frame = ttk.LabelFrame(self.tab_ops, text=" Operation Log ")
         log_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.txt_ops_log = scrolledtext.ScrolledText(log_frame, height=10, font=("Consolas", 9), state="disabled")
@@ -135,11 +173,24 @@ class FlashProgrammerGUI:
         self.txt_ops_log.see(tk.END)
         self.txt_ops_log.config(state="disabled")
 
+    def cmd_clear_log(self):
+        self.txt_ops_log.config(state="normal")
+        self.txt_ops_log.delete('1.0', tk.END)
+        self.txt_ops_log.config(state="disabled")
+
     def refresh_ports(self):
         ports = [port.device for port in serial.tools.list_ports.comports()]
         self.port_cb['values'] = ports
         if ports:
             self.port_cb.current(0)
+
+    def on_freq_changed(self, event=None):
+        """ส่งคำสั่งตั้งค่าความถี่ SPI ไปยัง ESP32"""
+        if self.ser and self.ser.is_open:
+            freq_str = self.freq_cb.get().split(" ")[0]
+            resp = self.send_raw_cmd(f"SET_FREQ:{freq_str}")
+            if resp and resp.startswith("FREQ:OK"):
+                self.ops_log(f"[SYSTEM] SPI Frequency changed to {freq_str} MHz")
 
     def toggle_connection(self):
         if self.ser and self.ser.is_open:
@@ -158,31 +209,81 @@ class FlashProgrammerGUI:
                 time.sleep(1.8)
                 self.ser.reset_input_buffer()
                 self.set_led_status(True)
+                
+                # ส่งความถี่ SPI ปัจจุบันไปตั้งค่าที่ ESP32
+                self.on_freq_changed()
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to connect: {e}")
                 self.set_led_status(False)
 
-    def send_cmd(self, command):
-        if not self.ser or not self.ser.is_open:
-            messagebox.showwarning("Warning", "Please connect to COM Port first!")
-            return None
+    def send_raw_cmd(self, command):
+        """ส่งคำสั่งเดี่ยวสั้นๆ"""
         try:
             self.ser.reset_input_buffer()
             self.ser.write((command + "\n").encode('utf-8'))
             return self.ser.readline().decode('utf-8', errors='ignore').strip()
         except Exception:
+            return None
+
+    def execute_cmd_with_progress(self, command, expected_end_tokens, timeout=45.0):
+        """ฟังก์ชันส่วนกลางสำหรับประมวลผลคำสั่งและรับ Progress 0-100%"""
+        if not self.ser or not self.ser.is_open:
+            messagebox.showwarning("Warning", "Please connect to COM Port first!")
+            return None
+
+        self.update_progress(0)
+        try:
+            self.ser.reset_input_buffer()
+            self.ser.write((command + "\n").encode('utf-8'))
+
+            old_timeout = self.ser.timeout
+            self.ser.timeout = timeout
+            start_time = time.time()
+            final_resp = None
+
+            while True:
+                if time.time() - start_time > timeout:
+                    self.ops_log("[ERROR] Operation timed out!")
+                    break
+
+                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                if not line:
+                    continue
+
+                if line.startswith("PROGRESS:"):
+                    try:
+                        pct = int(line.split(":")[1])
+                        self.update_progress(pct)
+                    except ValueError:
+                        pass
+                elif line.startswith("FAIL_ADDR:"):
+                    parts = line.split(":")
+                    self.ops_log(f"  ❌ Mismatch @ {parts[1]} | Details: {parts[2]}")
+                    self.root.update()
+                else:
+                    for token in expected_end_tokens:
+                        if line.startswith(token) or line == token:
+                            final_resp = line
+                            break
+                    if final_resp:
+                        break
+
+            self.ser.timeout = old_timeout
+            return final_resp
+        except Exception as e:
+            self.ops_log(f"[ERROR] Communication failure: {e}")
             self.set_led_status(False)
             return None
 
     def cmd_read_id(self):
-        resp = self.send_cmd("READ_ID")
+        resp = self.execute_cmd_with_progress("READ_ID", ["ID:"])
         if resp and resp.startswith("ID:"):
             self.lbl_jedec.config(text=f"JEDEC ID: {resp[3:]}")
         else:
             messagebox.showerror("Error", "Failed to read JEDEC ID")
 
     def cmd_unlock(self):
-        resp = self.send_cmd("UNLOCK")
+        resp = self.execute_cmd_with_progress("UNLOCK", ["UNLOCK:OK"])
         if resp == "UNLOCK:OK":
             messagebox.showinfo("Success", "Global Block Protection Unlocked!")
             self.cmd_read_regs()
@@ -190,7 +291,7 @@ class FlashProgrammerGUI:
             messagebox.showerror("Error", "Unlock failed")
 
     def cmd_read_regs(self):
-        resp = self.send_cmd("READ_REGS")
+        resp = self.execute_cmd_with_progress("READ_REGS", ["REGS:"])
         if resp and resp.startswith("REGS:"):
             parts = resp.split(":")
             stat_hex, cfg_hex = parts[1], parts[2]
@@ -202,15 +303,25 @@ class FlashProgrammerGUI:
         else:
             messagebox.showerror("Error", "Failed to read registers")
 
-    # --- Memory Operations (Tab 2 Functions) ---
-    def cmd_erase(self):
+    def cmd_erase_sector(self):
         addr = self.ent_addr.get().strip()
         self.ops_log(f"[ACTION] Erasing 4KB Sector at {addr}...")
-        resp = self.send_cmd(f"ERASE:{addr}")
+        resp = self.execute_cmd_with_progress(f"ERASE:{addr}", ["ERASE:OK"])
         if resp == "ERASE:OK":
             self.ops_log(f"[SUCCESS] Sector {addr} Erased.")
         else:
             self.ops_log(f"[FAIL] Erase failed: {resp}")
+
+    def cmd_erase_chip(self):
+        """2. ฟังก์ชันลบทั้งชิป (Chip Erase)"""
+        if not messagebox.askyesno("Confirm Erase", "Are you sure you want to erase ENTIRE CHIP (2MB)?"):
+            return
+        self.ops_log("[ACTION] Erasing ENTIRE CHIP (2 Megabytes)... Please wait...")
+        resp = self.execute_cmd_with_progress("ERASE_CHIP", ["ERASE_CHIP:OK"], timeout=60.0)
+        if resp == "ERASE_CHIP:OK":
+            self.ops_log("[SUCCESS] 💥 Entire Chip Erased Successfully!")
+        else:
+            self.ops_log(f"[FAIL] Chip Erase failed: {resp}")
 
     def cmd_write_pat(self):
         addr = self.ent_addr.get().strip()
@@ -219,13 +330,26 @@ class FlashProgrammerGUI:
         self.ops_log(f"[ACTION] Writing Pattern #{pat_idx} to {addr} (Len: {length} bytes)...")
         
         t0 = time.time()
-        resp = self.send_cmd(f"WRITE_PAT:{addr}:{length}:{pat_idx}")
+        resp = self.execute_cmd_with_progress(f"WRITE_PAT:{addr}:{length}:{pat_idx}", ["WRITE_PAT:OK"])
         t1 = time.time()
 
         if resp == "WRITE_PAT:OK":
             self.ops_log(f"[SUCCESS] Pattern Written in {t1-t0:.3f} seconds!")
         else:
             self.ops_log(f"[FAIL] Write Pattern failed: {resp}")
+
+    def cmd_write_full_chip(self):
+        pat_idx = self.pat_cb.get().split(":")[0]
+        self.ops_log(f"[ACTION] Writing Pattern #{pat_idx} to ENTIRE CHIP (2MB)...")
+        
+        t0 = time.time()
+        resp = self.execute_cmd_with_progress(f"WRITE_FULL_PAT:{pat_idx}", ["WRITE_PAT:OK"], timeout=60.0)
+        t1 = time.time()
+
+        if resp == "WRITE_PAT:OK":
+            self.ops_log(f"[SUCCESS] 🚀 Full Chip Written in {t1-t0:.2f} seconds!")
+        else:
+            self.ops_log(f"[FAIL] Write Full Chip failed: {resp}")
 
     def cmd_verify_pat(self):
         addr = self.ent_addr.get().strip()
@@ -234,7 +358,7 @@ class FlashProgrammerGUI:
         self.ops_log(f"[ACTION] Verifying Pattern #{pat_idx} at {addr} (Len: {length} bytes)...")
 
         t0 = time.time()
-        resp = self.send_cmd(f"VERIFY:{addr}:{length}:{pat_idx}")
+        resp = self.execute_cmd_with_progress(f"VERIFY:{addr}:{length}:{pat_idx}", ["VERIFY:OK", "VERIFY:FAIL:"])
         t1 = time.time()
 
         if resp == "VERIFY:OK":
@@ -246,10 +370,27 @@ class FlashProgrammerGUI:
         else:
             self.ops_log(f"[FAIL] Verify command failed: {resp}")
 
+    def cmd_verify_full_chip(self):
+        pat_idx = self.pat_cb.get().split(":")[0]
+        self.ops_log(f"[ACTION] Verifying ENTIRE CHIP with Pattern #{pat_idx}...")
+
+        t0 = time.time()
+        resp = self.execute_cmd_with_progress(f"VERIFY_FULL_PAT:{pat_idx}", ["VERIFY_FULL:DONE:"], timeout=60.0)
+        t1 = time.time()
+
+        if resp and resp.startswith("VERIFY_FULL:DONE:"):
+            total_errors = int(resp.split(":")[2])
+            if total_errors == 0:
+                self.ops_log(f"[PASSED] 🟢 Full Chip Verification PASSED (0 Failures) in {t1-t0:.2f}s!")
+            else:
+                self.ops_log(f"[FAILED] 🔴 Full Chip Verification FAILED! Total {total_errors} Failed Bytes in {t1-t0:.2f}s.")
+        else:
+            self.ops_log(f"[FAIL] Full verify failed: {resp}")
+
     def cmd_read_data(self):
         addr = self.ent_addr.get().strip()
         length = self.ent_len.get().strip()
-        resp = self.send_cmd(f"READ:{addr}:{length}")
+        resp = self.execute_cmd_with_progress(f"READ:{addr}:{length}", ["DATA:"])
         if resp and resp.startswith("DATA:"):
             self.ops_log(f"[READ @ {addr}] {resp[5:]}")
         else:
