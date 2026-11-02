@@ -17,10 +17,26 @@
 
 uint32_t currentSpiFreqHz = 10000000; // ค่าเริ่มต้น 10 MHz
 
+// ฟังก์ชันเช็กคำสั่งยกเลิกกลางคันจาก GUI
+bool checkStopCommand() {
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input == "STOP") {
+      return true;
+    }
+  }
+  return false;
+}
+
 void waitBusyWithProgress() {
   uint8_t status;
   int step = 0;
   do {
+    if (checkStopCommand()) {
+      Serial.println("ABORTED");
+      return;
+    }
     SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
     digitalWrite(CS_PIN, LOW);
     SPI.transfer(CMD_READ_STATUS);
@@ -64,6 +80,11 @@ void writePattern(uint32_t addr, uint32_t len, int patternType) {
   Serial.println("PROGRESS:0");
 
   while (bytesWritten < len) {
+    if (checkStopCommand()) {
+      Serial.println("ABORTED");
+      return;
+    }
+
     uint32_t currentAddr = addr + bytesWritten;
     uint16_t chunkSize = 256 - (currentAddr % 256);
     if (bytesWritten + chunkSize > len) {
@@ -128,6 +149,13 @@ void verifyPattern(uint32_t addr, uint32_t len, int patternType) {
   SPI.transfer(addr & 0xFF);
 
   for (uint32_t i = 0; i < len; i++) {
+    if ((i % 1024 == 0) && checkStopCommand()) {
+      digitalWrite(CS_PIN, HIGH);
+      SPI.endTransaction();
+      Serial.println("ABORTED");
+      return;
+    }
+
     uint8_t actual = SPI.transfer(0x00);
     uint8_t expected = getPatternByte(i, patternType);
 
@@ -160,7 +188,7 @@ void verifyPattern(uint32_t addr, uint32_t len, int patternType) {
 
 void verifyFullChip(int patternType) {
   uint32_t totalErrors = 0;
-  const uint32_t maxPrintedErrors = 500;
+  const uint32_t maxPrintedErrors = 100;
   int lastPct = -1;
 
   Serial.println("PROGRESS:0");
@@ -173,6 +201,13 @@ void verifyFullChip(int patternType) {
   SPI.transfer(0x00);
 
   for (uint32_t i = 0; i < FLASH_SIZE_2MB; i++) {
+    if ((i % 2048 == 0) && checkStopCommand()) {
+      digitalWrite(CS_PIN, HIGH);
+      SPI.endTransaction();
+      Serial.println("ABORTED");
+      return;
+    }
+
     uint8_t actual = SPI.transfer(0x00);
     uint8_t expected = getPatternByte(i, patternType);
 
@@ -334,7 +369,6 @@ void processCommand(String cmd) {
 }
 
 void setup() {
-  // สั่งเปิดความเร็ว Serial Baud Rate ไปที่ 921,600 bps
   Serial.begin(921600);
   pinMode(CS_PIN, OUTPUT);
   digitalWrite(CS_PIN, HIGH);

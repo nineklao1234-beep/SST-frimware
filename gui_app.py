@@ -8,12 +8,13 @@ class FlashProgrammerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("SST26VF016B Tester & Programmer - ESP32")
-        self.root.geometry("820x580")
+        self.root.geometry("860x580")
         self.root.resizable(False, False)
         
         self.ser = None
         self.current_hex_addr = 0x000000
         self.bytes_per_page = 256
+        self.stop_requested = False
 
         style = ttk.Style()
         style.theme_use('clam')
@@ -37,25 +38,30 @@ class FlashProgrammerGUI:
         self.led_circle = self.led_canvas.create_oval(2, 2, 16, 16, fill="#FF3B30", outline="#B30000")
 
         self.lbl_status = ttk.Label(top_bar, text="Disconnected", font=("Segoe UI", 9, "bold"), foreground="#FF3B30")
-        self.lbl_status.grid(row=0, column=5, padx=(2, 10), pady=8)
+        self.lbl_status.grid(row=0, column=5, padx=(2, 8), pady=8)
 
-        ttk.Label(top_bar, text="SPI Speed:").grid(row=0, column=6, padx=(10, 2), pady=8)
+        ttk.Label(top_bar, text="SPI Speed:").grid(row=0, column=6, padx=(5, 2), pady=8)
         self.freq_cb = ttk.Combobox(top_bar, width=8, state="readonly")
         self.freq_cb['values'] = ["1 MHz", "5 MHz", "10 MHz", "20 MHz", "40 MHz"]
         self.freq_cb.current(2)
         self.freq_cb.grid(row=0, column=7, padx=2, pady=8)
         self.freq_cb.bind("<<ComboboxSelected>>", self.on_freq_changed)
 
+        # Progress Bar & % Display
         prog_frame = ttk.Frame(top_bar)
-        prog_frame.grid(row=0, column=8, padx=(15, 8), pady=8, sticky="e")
+        prog_frame.grid(row=0, column=8, padx=(10, 5), pady=8, sticky="e")
         top_bar.grid_columnconfigure(8, weight=1)
 
         self.progress_var = tk.DoubleVar()
-        self.progressbar = ttk.Progressbar(prog_frame, variable=self.progress_var, maximum=100, length=110)
+        self.progressbar = ttk.Progressbar(prog_frame, variable=self.progress_var, maximum=100, length=90)
         self.progressbar.pack(side="left", padx=2)
 
-        self.lbl_progress = ttk.Label(prog_frame, text="0%", font=("Segoe UI", 9, "bold"), width=5)
+        self.lbl_progress = ttk.Label(prog_frame, text="0%", font=("Segoe UI", 9, "bold"), width=4)
         self.lbl_progress.pack(side="left", padx=2)
+
+        # ปุ่มตัดการทำงาน (STOP Button)
+        btn_stop = tk.Button(prog_frame, text="⛔ STOP", command=self.cmd_stop, bg="#FF3B30", fg="white", font=("Segoe UI", 8, "bold"), relief="flat", padx=6)
+        btn_stop.pack(side="left", padx=(5, 2))
 
         # --- Tab System ---
         self.notebook = ttk.Notebook(root)
@@ -71,12 +77,22 @@ class FlashProgrammerGUI:
         self.notebook.add(self.tab_ops, text=" ⚡ Memory Operations ")
         self.setup_tab_ops()
 
-        # Tab 3: Dedicated Hex Viewer (หน้าใหม่แยกออกมา)
+        # Tab 3: Hex Viewer
         self.tab_hex = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_hex, text=" 🔍 Hex Viewer ")
         self.setup_tab_hex()
 
         self.refresh_ports()
+
+    def cmd_stop(self):
+        """ส่งคำสั่งตัดการทำงานไปยัง ESP32 ทันที"""
+        self.stop_requested = True
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.write(b"STOP\n")
+                self.ops_log("[SYSTEM] ⛔ Stop command sent to ESP32!")
+            except Exception as e:
+                self.ops_log(f"[ERROR] Failed to send STOP command: {e}")
 
     def update_progress(self, pct):
         self.progress_var.set(pct)
@@ -167,7 +183,6 @@ class FlashProgrammerGUI:
         self.txt_ops_log.pack(fill="both", expand=True, padx=5, pady=5)
 
     def setup_tab_hex(self):
-        """โครงสร้างหน้าใหม่: Hex Viewer Tab"""
         nav_frame = ttk.LabelFrame(self.tab_hex, text=" Navigation & Controls ")
         nav_frame.pack(fill="x", padx=10, pady=5)
 
@@ -191,7 +206,6 @@ class FlashProgrammerGUI:
         self.txt_hex_display.pack(fill="both", expand=True, padx=5, pady=5)
 
     def load_hex_view_page(self):
-        """ดึงข้อมูลจาก ESP32 มาแสดงตาราง Hex บนหน้า Hex Viewer"""
         addr_str = f"0x{self.current_hex_addr:06X}"
         self.lbl_hex_page_info.config(text=f"Page: 0x{self.current_hex_addr:06X} - 0x{self.current_hex_addr + self.bytes_per_page - 1:06X}")
         
@@ -230,7 +244,7 @@ class FlashProgrammerGUI:
     def cmd_hex_jump(self):
         try:
             addr = int(self.ent_hex_jump.get().strip(), 16)
-            addr = addr & ~0xF  # Align 16 ไบต์
+            addr = addr & ~0xF
             if 0 <= addr < 0x200000:
                 self.current_hex_addr = addr
                 self.load_hex_view_page()
@@ -288,7 +302,6 @@ class FlashProgrammerGUI:
                 messagebox.showerror("Error", "No COM Port selected!")
                 return
             try:
-                # ปรับ Baud Rate เป็น 921,600 bps
                 self.ser = serial.Serial(port, 921600, timeout=3)
                 self.ser.dtr = False
                 self.ser.rts = False
@@ -313,7 +326,9 @@ class FlashProgrammerGUI:
             messagebox.showwarning("Warning", "Please connect to COM Port first!")
             return None
 
+        self.stop_requested = False
         self.update_progress(0)
+        
         try:
             self.ser.reset_input_buffer()
             self.ser.write((command + "\n").encode('utf-8'))
@@ -322,8 +337,15 @@ class FlashProgrammerGUI:
             self.ser.timeout = timeout
             start_time = time.time()
             final_resp = None
+            printed_errors = 0
 
             while True:
+                if self.stop_requested:
+                    self.ser.write(b"STOP\n")
+                    self.ops_log("[ABORTED] Operation stopped by user!")
+                    self.update_progress(0)
+                    break
+
                 if time.time() - start_time > timeout:
                     self.ops_log("[ERROR] Operation timed out!")
                     break
@@ -339,9 +361,18 @@ class FlashProgrammerGUI:
                     except ValueError:
                         pass
                 elif line.startswith("FAIL_ADDR:"):
-                    parts = line.split(":")
-                    self.ops_log(f"  ❌ Mismatch @ {parts[1]} | Details: {parts[2]}")
+                    printed_errors += 1
+                    # ป้องกันข้อความขยะถล่มหน้าจอ: แสดงผลสูงสุดเฉพาะ 20 รายการแรก
+                    if printed_errors <= 20:
+                        parts = line.split(":")
+                        self.ops_log(f"  ❌ Mismatch @ {parts[1]} | Details: {parts[2]}")
+                    elif printed_errors == 21:
+                        self.ops_log("  ⚠️ [NOTICE] Mismatch count exceeds 20. Suppressing further error prints to avoid UI lag...")
                     self.root.update()
+                elif line == "ABORTED":
+                    self.ops_log("[ABORTED] Hardware operation canceled.")
+                    self.update_progress(0)
+                    break
                 else:
                     for token in expected_end_tokens:
                         if line.startswith(token) or line == token:
@@ -464,7 +495,7 @@ class FlashProgrammerGUI:
             if total_errors == 0:
                 self.ops_log(f"[PASSED] 🟢 Full Chip Verification PASSED (0 Failures) in {t1-t0:.2f}s!")
             else:
-                self.ops_log(f"[FAILED] 🔴 Full Chip Verification FAILED! Total {total_errors} Failed Bytes in {t1-t0:.2f}s.")
+                self.ops_log(f"[FAILED] 🔴 Full Chip Verification FAILED! Total {total_errors:,} Mismatched Bytes in {t1-t0:.2f}s.")
         else:
             self.ops_log(f"[FAIL] Full verify failed: {resp}")
 
