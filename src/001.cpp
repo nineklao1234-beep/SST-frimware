@@ -18,6 +18,7 @@
 
 uint32_t currentSpiFreqHz = 10000000;
 String serialRxBuf = "";
+static uint8_t readDataBuf[4096]; // Buffer for Sector (4KB) reading
 
 bool checkStopCommand() {
   while (Serial.available()) {
@@ -69,23 +70,22 @@ void writeEnable() {
   SPI.endTransaction();
 }
 
-// Pattern Generator (New Ordered Sequence)
-// 0: 0xFF, 1: 0x00, 2: 0xAA, 3: 0x55, 4: Custom, 5: Random, 6: Alt AA/55, 7: Inc
+// Pattern Generator (0: 0xFF, 1: 0x00, 2: 0xAA, 3: 0x55, 4: Custom, 5: Random, 6: Alt AA/55, 7: Inc)
 uint8_t getPatternByte(uint32_t offset, int patternType, uint8_t customVal = 0x00) {
   switch (patternType) {
-    case 0: return 0xFF; // All 0xFF
-    case 1: return 0x00; // All 0x00
-    case 2: return 0xAA; // All 0xAA
-    case 3: return 0x55; // All 0x55
-    case 4: return customVal; // Custom Hex
+    case 0: return 0xFF;
+    case 1: return 0x00;
+    case 2: return 0xAA;
+    case 3: return 0x55;
+    case 4: return customVal;
     case 5: { // Pseudo-Random Hash
       uint32_t hash = offset ^ 0x5BF03635;
       hash = (hash ^ (hash >> 16)) * 0x45d9f3b;
       hash = (hash ^ (hash >> 16)) * 0x45d9f3b;
       return (uint8_t)((hash ^ (hash >> 16)) & 0xFF);
     }
-    case 6: return (offset % 2 == 0) ? 0xAA : 0x55; // Alt AA/55
-    case 7: return (uint8_t)(offset & 0xFF); // Inc (0x00-0xFF)
+    case 6: return (offset % 2 == 0) ? 0xAA : 0x55;
+    case 7: return (uint8_t)(offset & 0xFF);
     default: return 0xFF;
   }
 }
@@ -186,7 +186,7 @@ bool verifyPattern(uint32_t addr, uint32_t len, int patternType, uint8_t customV
         actualErr = actual;
       }
       outErrors++;
-      if (reportedErrs < 100) { // Stream up to 100 error lines for GUI navigation mapping
+      if (reportedErrs < 200) {
         Serial.printf("FAIL_ADDR:0x%06X:EXP_0x%02X_GOT_0x%02X\n", addr + i, expected, actual);
         reportedErrs++;
       }
@@ -442,7 +442,7 @@ void processCommand(String cmd) {
     if (len <= 0) len = 16;
     if (len > 4096) len = 4096;
 
-    Serial.println("PROGRESS:0");
+    Serial.println("PROGRESS:20");
     SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
     digitalWrite(CS_PIN, LOW);
     SPI.transfer(CMD_READ_DATA);
@@ -450,15 +450,23 @@ void processCommand(String cmd) {
     SPI.transfer((addr >> 8) & 0xFF);
     SPI.transfer(addr & 0xFF);
 
+    for (int i = 0; i < len; i++) {
+      readDataBuf[i] = SPI.transfer(0x00);
+      if (len >= 512 && (i % 512 == 0)) {
+        int pct = 20 + (int)((uint64_t)i * 60 / len);
+        Serial.printf("PROGRESS:%d\n", pct);
+      }
+    }
+    digitalWrite(CS_PIN, HIGH);
+    SPI.endTransaction();
+
+    Serial.println("PROGRESS:85");
     Serial.print("DATA:");
     for (int i = 0; i < len; i++) {
-      uint8_t b = SPI.transfer(0x00);
-      Serial.printf("%02X", b);
+      Serial.printf("%02X", readDataBuf[i]);
       if (i < len - 1) Serial.print(" ");
     }
     Serial.println();
-    digitalWrite(CS_PIN, HIGH);
-    SPI.endTransaction();
     Serial.println("PROGRESS:100");
   }
 }
