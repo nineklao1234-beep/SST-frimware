@@ -18,7 +18,7 @@ class FlashProgrammerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("SST26VF016B Tester & Programmer - ESP32")
-        self.root.geometry("1060x740")
+        self.root.geometry("1060x760")
         self.root.resizable(False, False)
         
         self.ser = None
@@ -27,9 +27,8 @@ class FlashProgrammerGUI:
         self.stop_requested = False
         self.is_syncing = False
 
-        # Multi-page Fail Tracking Engine
-        self.failed_pages = []            # Unique failing page start addresses [0x001000, 0x001C00, ...]
-        self.failed_page_err_counts = {}  # Page Addr -> Error Count mapping
+        self.failed_pages = []
+        self.failed_page_err_counts = {}
         self.current_fail_idx = -1
         self.last_verified_pat_type = None
         self.last_verified_custom_hex = "AA"
@@ -85,7 +84,7 @@ class FlashProgrammerGUI:
         btn_stop = tk.Button(prog_frame, text="⛔ STOP", command=self.cmd_stop, bg="#FF3B30", fg="white", font=("Segoe UI", 8, "bold"), relief="flat", padx=8)
         btn_stop.pack(side="left", padx=(5, 2))
 
-        # Register Diagnostics Sub-bar
+        # Register Diagnostics Sub-bar (With Device Name directly under JEDEC ID)
         row1 = ttk.Frame(top_bar)
         row1.pack(fill="x", padx=5, pady=(2, 4))
 
@@ -93,8 +92,15 @@ class FlashProgrammerGUI:
         ttk.Button(row1, text="Unlock Protection", command=self.cmd_unlock).pack(side="left", padx=2)
         ttk.Button(row1, text="Read Registers", command=self.cmd_read_regs).pack(side="left", padx=2)
 
-        self.lbl_jedec = ttk.Label(row1, text="JEDEC ID: -- -- --", font=("Consolas", 9, "bold"))
-        self.lbl_jedec.pack(side="left", padx=(12, 6))
+        # Vertical Frame for JEDEC ID & Device Name
+        jedec_info_frame = ttk.Frame(row1)
+        jedec_info_frame.pack(side="left", padx=(12, 6))
+
+        self.lbl_jedec = ttk.Label(jedec_info_frame, text="JEDEC ID: -- -- --", font=("Consolas", 9, "bold"))
+        self.lbl_jedec.pack(anchor="w")
+
+        self.lbl_device = ttk.Label(jedec_info_frame, text="Device: --", font=("Segoe UI", 8, "italic"), foreground="#444444")
+        self.lbl_device.pack(anchor="w")
 
         self.lbl_stat_reg = ttk.Label(row1, text="SR(0x05): --", font=("Consolas", 9))
         self.lbl_stat_reg.pack(side="left", padx=6)
@@ -301,7 +307,6 @@ class FlashProgrammerGUI:
         self.ent_len.insert(0, "4096")
         self.ent_len.grid(row=2, column=3, padx=5, pady=4, sticky="w")
 
-        # Re-ordered Pattern Dropdown
         ttk.Label(cfg_frame, text="Pattern Type:").grid(row=3, column=0, padx=5, pady=4, sticky="e")
         self.pat_cb = ttk.Combobox(cfg_frame, width=24, state="readonly")
         self.pat_cb['values'] = [
@@ -369,10 +374,9 @@ class FlashProgrammerGUI:
             self.ent_custom_hex.config(state="disabled")
 
     # -------------------------------------------------------------------------
-    # TAB 2: DEDICATED HEX VIEWER (With Multi-Fail Navigation & Red Highlight)
+    # TAB 2: DEDICATED HEX VIEWER (Manual Load Mode)
     # -------------------------------------------------------------------------
     def setup_tab_hex(self):
-        # Top Navigation Bar
         nav_frame = ttk.LabelFrame(self.tab_hex, text=" Navigation & View Granularity ")
         nav_frame.pack(fill="x", padx=10, pady=4)
 
@@ -403,7 +407,7 @@ class FlashProgrammerGUI:
         self.lbl_hex_page_info = ttk.Label(nav_frame, text="Range: 0x000000 - 0x0000FF", font=("Consolas", 9, "bold"))
         self.lbl_hex_page_info.grid(row=0, column=9, padx=10, pady=4)
 
-        # Multi-Fail Navigation Sub-bar (Option 1 FA Feature)
+        # Multi-Fail Navigation Sub-bar
         fail_nav_frame = ttk.LabelFrame(self.tab_hex, text=" 🔴 Verification Failure Navigation (FA Inspection) ")
         fail_nav_frame.pack(fill="x", padx=10, pady=3)
 
@@ -423,7 +427,7 @@ class FlashProgrammerGUI:
 
         self.txt_hex_display = scrolledtext.ScrolledText(view_frame, font=("Consolas", 10), state="disabled", bg="#1E1E1E", fg="#D4D4D4")
         self.txt_hex_display.pack(fill="both", expand=True, padx=5, pady=5)
-        self.txt_hex_display.tag_config("mismatch", background="#FF3B30", foreground="#FFFFFF") # Red Highlight
+        self.txt_hex_display.tag_config("mismatch", background="#FF3B30", foreground="#FFFFFF")
 
     def on_hex_view_size_changed(self, event=None):
         if "Sector" in self.hex_view_size_cb.get():
@@ -449,13 +453,13 @@ class FlashProgrammerGUI:
         end_addr = self.target_hex_addr + self.bytes_per_view - 1
         self.lbl_hex_page_info.config(text=f"Range: 0x{self.target_hex_addr:06X} - 0x{end_addr:06X}")
 
+    # Manual Navigation: Update labels & fields without auto-loading hardware
     def cmd_hex_prev_block(self):
         if self.target_hex_addr >= self.bytes_per_view:
             self.target_hex_addr -= self.bytes_per_view
             self.ent_hex_jump.delete(0, tk.END)
             self.ent_hex_jump.insert(0, f"0x{self.target_hex_addr:06X}")
             self.update_hex_view_labels()
-            self.load_hex_view_page()
 
     def cmd_hex_next_block(self):
         if self.target_hex_addr + self.bytes_per_view < 0x200000:
@@ -463,9 +467,7 @@ class FlashProgrammerGUI:
             self.ent_hex_jump.delete(0, tk.END)
             self.ent_hex_jump.insert(0, f"0x{self.target_hex_addr:06X}")
             self.update_hex_view_labels()
-            self.load_hex_view_page()
 
-    # Multi-Fail Navigation Engine Handlers
     def update_fail_navigation_ui(self):
         if not self.failed_pages:
             self.fail_nav_cb['values'] = []
@@ -494,7 +496,6 @@ class FlashProgrammerGUI:
             self.ent_hex_jump.insert(0, f"0x{self.target_hex_addr:06X}")
             self.update_hex_view_labels()
             self.update_fail_navigation_ui()
-            self.load_hex_view_page()
 
     def on_fail_dropdown_selected(self, event=None):
         idx = self.fail_nav_cb.current()
@@ -542,15 +543,18 @@ class FlashProgrammerGUI:
             messagebox.showerror("Error", "Invalid Hex Address format")
             return
 
+        self.update_phase_status("[ Phase: LOADING HEX DATA... ]")
         addr_str = f"0x{self.target_hex_addr:06X}"
         resp = self.execute_cmd_with_progress(f"READ:{addr_str}:{self.bytes_per_view}", ["DATA:"])
         if not resp or not resp.startswith("DATA:"):
+            self.update_phase_status("[ State: IDLE ]")
             return
 
         raw_hex_list = resp[5:].strip().split(" ")
         try:
             raw_bytes = bytes([int(x, 16) for x in raw_hex_list])
         except ValueError:
+            self.update_phase_status("[ State: IDLE ]")
             return
 
         self.txt_hex_display.config(state="normal")
@@ -560,20 +564,17 @@ class FlashProgrammerGUI:
         header += "-" * 77 + "\n"
         self.txt_hex_display.insert(tk.END, header)
 
-        line_num = 3  # Line 1 header, line 2 separator
         for i in range(0, len(raw_bytes), 16):
             chunk = raw_bytes[i:i+16]
             row_addr = f"{self.target_hex_addr + i:08X}"
             
             self.txt_hex_display.insert(tk.END, f"{row_addr}  ")
 
-            # Format Hex Portion & Apply Red Highlight on Mismatches
             for j in range(len(chunk)):
                 b = chunk[j]
                 byte_offset = i + j
                 abs_addr = self.target_hex_addr + byte_offset
                 
-                # Check for mismatch against expected pattern
                 is_mismatch = False
                 if self.last_verified_pat_type is not None:
                     exp_b = self.get_expected_byte(abs_addr, self.last_verified_pat_type, self.last_verified_custom_hex)
@@ -591,7 +592,6 @@ class FlashProgrammerGUI:
                 elif j < 15:
                     self.txt_hex_display.insert(tk.END, " ")
 
-            # Padding for incomplete rows
             if len(chunk) < 16:
                 rem = 16 - len(chunk)
                 pad_space = rem * 3 + (1 if len(chunk) <= 8 else 0)
@@ -599,7 +599,6 @@ class FlashProgrammerGUI:
 
             self.txt_hex_display.insert(tk.END, "  |")
 
-            # Format ASCII Portion & Apply Red Highlight on Mismatches
             for j in range(len(chunk)):
                 b = chunk[j]
                 abs_addr = self.target_hex_addr + i + j
@@ -617,9 +616,9 @@ class FlashProgrammerGUI:
                     self.txt_hex_display.insert(tk.END, char_str)
 
             self.txt_hex_display.insert(tk.END, "|\n")
-            line_num += 1
 
         self.txt_hex_display.config(state="disabled")
+        self.update_phase_status("[ State: IDLE ]")
 
     # -------------------------------------------------------------------------
     # System Operations & Handlers
@@ -867,7 +866,7 @@ class FlashProgrammerGUI:
         self.update_progress(0)
         self.update_phase_status("[ State: IDLE ]")
 
-        # Auto Jump & Multi-Fail Setup
+        # Setup navigation for failed pages
         self.update_fail_navigation_ui()
         if self.failed_pages:
             self.notebook.select(1)
@@ -948,7 +947,6 @@ class FlashProgrammerGUI:
 
             self.update_phase_status("[ State: IDLE ]")
 
-            # Setup Multi-Fail Navigation & Auto-jump to First Fail
             self.update_fail_navigation_ui()
             if self.failed_pages:
                 self.notebook.select(1)
@@ -974,7 +972,8 @@ class FlashProgrammerGUI:
         if resp and resp.startswith("ID:"):
             id_str = resp[3:].strip()
             dev_name = JEDEC_DB.get(id_str, "Unknown / Unsupported Flash IC")
-            self.lbl_jedec.config(text=f"JEDEC ID: {id_str} ({dev_name})")
+            self.lbl_jedec.config(text=f"JEDEC ID: {id_str}")
+            self.lbl_device.config(text=f"Device: {dev_name}")
             if id_str in ["00 00 00", "FF FF FF"]:
                 self.update_pin_health({1: "#FF3B30", 2: "#FF3B30", 4: "#FF3B30", 5: "#FF3B30", 6: "#FF3B30", 8: "#FF3B30"})
             else:
