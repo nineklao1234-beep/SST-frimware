@@ -635,7 +635,7 @@ class FlashProgrammerGUI:
     # -------------------------------------------------------------------------
     # TAB 3: DEDICATED FLASH BITMAP TAB
     # -------------------------------------------------------------------------
-        def setup_tab_bitmap(self):
+    def setup_tab_bitmap(self):
         header_frame = ttk.LabelFrame(self.tab_bitmap, text=" 🗺️ 512 Sector Flash Memory Block Map (4KB / Sector) ")
         header_frame.pack(fill="x", padx=10, pady=5)
 
@@ -694,7 +694,7 @@ class FlashProgrammerGUI:
 
         self.render_bitmap_grid()
 
-        def render_bitmap_grid(self):
+    def render_bitmap_grid(self):
         """ High performance fast Canvas drawing for 512 Sector blocks """
         self.bitmap_canvas.delete("all")
         self.bitmap_rects.clear()
@@ -743,7 +743,7 @@ class FlashProgrammerGUI:
         total_h = start_y + rows * (box_h + pad_y) + 10
         self.bitmap_canvas.config(scrollregion=(0, 0, total_w, total_h))
 
-        def on_bitmap_click(self, event):
+    def on_bitmap_click(self, event):
         cols = 32
         box_w = 28
         box_h = 24
@@ -1567,11 +1567,7 @@ class FlashProgrammerGUI:
                             self.failed_page_err_counts[page_addr] += 1
                     except ValueError:
                         pass
-
-                    if printed_errors <= 20:
-                        self.ops_log(f"  ❌ Mismatch @ {parts[1]} | Details: {sample_detail}")
-                    elif printed_errors == 21:
-                        self.ops_log("  ⚠️ [NOTICE] Mismatch count exceeds 20. Suppressing further error prints...")
+                    pass # Suppress individual fail logs, recorded silently for FA tab
                 elif line == "ABORTED":
                     self.ops_log("[ABORTED] Hardware operation canceled.")
                     self.update_progress(0)
@@ -1680,9 +1676,7 @@ class FlashProgrammerGUI:
                         self.failed_page_err_counts[page_addr] += 1
                 except ValueError:
                     pass
-
-                if printed_errors <= 20:
-                    self.ops_log(f"    ❌ Mismatch @ {parts[1]} | {sample_detail}")
+                pass # Suppress individual fail logs, recorded silently for FA tab
 
             elif line.startswith("PAT_DONE:"):
                 parts = line.split(":")
