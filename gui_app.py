@@ -490,7 +490,7 @@ class FlashProgrammerGUI:
         self.lbl_fa_total_bytes.grid(row=2, column=1, sticky="w", padx=4)
 
         ttk.Label(sub_grid, text="Chip Defect Rate:").grid(row=2, column=2, sticky="e", padx=4)
-        self.lbl_fa_defect_rate = ttk.Label(sub_grid, text="0.00 %", font=("Consolas", 9, "bold"), foreground="#34C759")
+        self.lbl_fa_defect_rate = ttk.Label(sub_grid, text="0.00 %", font=("Segoe UI", 9, "bold"), foreground="#34C759")
         self.lbl_fa_defect_rate.grid(row=2, column=3, sticky="w", padx=4)
 
         table_frame = ttk.LabelFrame(self.tab_fa, text=" 📋 Detailed Failing Pages Directory ")
@@ -561,7 +561,7 @@ class FlashProgrammerGUI:
         for idx, page_addr in enumerate(self.failed_pages):
             sec_num = page_addr // 4096
             page_num = page_addr // 256
-            err_cnt = self.failed_page_err_counts.get(page_addr, 1)
+            err_cnt = self.failed_page_err_counts.get(page_addr, 256)
             sample_str = self.failed_page_samples.get(page_addr, "Mismatch Detected")
 
             self.fa_tree.insert("", "end", iid=str(idx), values=(
@@ -625,7 +625,7 @@ class FlashProgrammerGUI:
                 for idx, page_addr in enumerate(self.failed_pages):
                     sec_num = page_addr // 4096
                     page_num = page_addr // 256
-                    err_cnt = self.failed_page_err_counts.get(page_addr, 1)
+                    err_cnt = self.failed_page_err_counts.get(page_addr, 256)
                     sample_str = self.failed_page_samples.get(page_addr, "")
                     writer.writerow([idx + 1, sec_num, page_num, f"0x{page_addr:06X}", err_cnt, sample_str])
             messagebox.showinfo("Success", f"FA Report exported successfully to:\n{filepath}")
@@ -918,7 +918,7 @@ class FlashProgrammerGUI:
         combo_vals = []
         for idx, page_addr in enumerate(self.failed_pages):
             page_num = page_addr // 256
-            err_cnt = self.failed_page_err_counts.get(page_addr, 1)
+            err_cnt = self.failed_page_err_counts.get(page_addr, 256)
             combo_vals.append(f"[{idx+1}/{total_pages}] Page {page_num} (0x{page_addr:06X}) - {err_cnt} Errors")
 
         self.fail_nav_cb['values'] = combo_vals
@@ -1063,10 +1063,9 @@ class FlashProgrammerGUI:
         self.update_phase_status("[ State: IDLE ]")
 
     # -------------------------------------------------------------------------
-    # TAB 5: DEDICATED TARGETED LOOP & STRESS TEST TAB (NEW FEATURE)
+    # TAB 5: DEDICATED TARGETED LOOP & STRESS TEST TAB
     # -------------------------------------------------------------------------
     def setup_tab_loop(self):
-        # 1. Target Context Banner
         target_frame = ttk.LabelFrame(self.tab_loop, text=" 🎯 Active Target Context ")
         target_frame.pack(fill="x", padx=10, pady=4)
 
@@ -1106,7 +1105,6 @@ class FlashProgrammerGUI:
         self.lbl_target_summary = ttk.Label(target_frame, text="🎯 TARGET: Page 0 | Sector 0 | Addr Range: 0x000000 - 0x0000FF (256 Bytes)", font=("Consolas", 9, "bold"), foreground="#007ACC")
         self.lbl_target_summary.pack(anchor="w", padx=10, pady=(2, 6))
 
-        # 2. Configuration & Conditions
         cfg_frame = ttk.LabelFrame(self.tab_loop, text=" ⚙️ Loop Execution Parameters & Stress Options ")
         cfg_frame.pack(fill="x", padx=10, pady=4)
 
@@ -1169,7 +1167,6 @@ class FlashProgrammerGUI:
         chk_stop_fail = ttk.Checkbutton(c_row2, text="🛑 Stop Immediately on First Failure", variable=self.stop_on_fail_var)
         chk_stop_fail.pack(side="left", padx=(16, 4))
 
-        # 3. Live Statistics Dashboard
         stat_frame = ttk.LabelFrame(self.tab_loop, text=" 📊 Real-time Stress Test Statistics ")
         stat_frame.pack(fill="x", padx=10, pady=4)
 
@@ -1188,7 +1185,6 @@ class FlashProgrammerGUI:
         self.lbl_stat_fail = ttk.Label(s_grid, text="0", font=("Consolas", 11, "bold"), foreground="#FF3B30")
         self.lbl_stat_fail.grid(row=0, column=5, sticky="w", padx=4)
 
-        # 4. Action Buttons
         act_row = ttk.Frame(self.tab_loop)
         act_row.pack(fill="x", padx=10, pady=4)
 
@@ -1204,7 +1200,6 @@ class FlashProgrammerGUI:
         btn_clear_loop_log = ttk.Button(act_row, text="🧹 Clear Event Log", command=self.cmd_clear_loop_log)
         btn_clear_loop_log.pack(side="right", padx=4)
 
-        # 5. Loop History & Error Log
         log_frame = ttk.LabelFrame(self.tab_loop, text=" 📜 Loop Event & Error Log History ")
         log_frame.pack(fill="both", expand=True, padx=10, pady=4)
 
@@ -1406,7 +1401,6 @@ class FlashProgrammerGUI:
                     is_pass = True
 
             elif "Erase -> Write -> Verify" in op_mode:
-                # Erase -> Write -> Verify Cycle
                 sec_val = self.ent_loop_sector.get().strip()
                 sec_addr = f"0x{int(sec_val)*4096:06X}" if sec_val.isdigit() else addr_str
                 resp_erase = self.execute_cmd_with_progress(f"ERASE:{sec_addr}", ["ERASE:OK"])
@@ -1451,7 +1445,7 @@ class FlashProgrammerGUI:
         self.update_phase_status("[ State: IDLE ]")
 
     # -------------------------------------------------------------------------
-    # System Operations & Handlers
+    # SYSTEM OPERATIONS & HANDLERS
     # -------------------------------------------------------------------------
     def ops_log(self, text):
         self.txt_ops_log.config(state="normal")
@@ -1561,10 +1555,8 @@ class FlashProgrammerGUI:
 
                         if page_addr not in self.failed_pages:
                             self.failed_pages.append(page_addr)
-                            self.failed_page_err_counts[page_addr] = 1
+                            self.failed_page_err_counts[page_addr] = 256
                             self.failed_page_samples[page_addr] = f"@{addr_hex} {sample_detail}"
-                        else:
-                            self.failed_page_err_counts[page_addr] += 1
                     except ValueError:
                         pass
                     pass # Suppress individual fail logs, recorded silently for FA tab
@@ -1670,10 +1662,8 @@ class FlashProgrammerGUI:
 
                     if page_addr not in self.failed_pages:
                         self.failed_pages.append(page_addr)
-                        self.failed_page_err_counts[page_addr] = 1
+                        self.failed_page_err_counts[page_addr] = 256
                         self.failed_page_samples[page_addr] = f"@{addr_hex} {sample_detail}"
-                    else:
-                        self.failed_page_err_counts[page_addr] += 1
                 except ValueError:
                     pass
                 pass # Suppress individual fail logs, recorded silently for FA tab
