@@ -3,6 +3,7 @@
 
 #define CS_PIN 5
 
+// SST26VF016B SPI Commands
 #define CMD_WREN         0x06
 #define CMD_ULBPR        0x98
 #define CMD_JEDEC_ID     0x9F
@@ -13,12 +14,12 @@
 #define CMD_READ_STATUS  0x05
 #define CMD_READ_CONFIG  0x35
 
-#define FLASH_SIZE_2MB   0x200000  // 2,097,152 Bytes
+#define FLASH_SIZE_2MB   0x200000  // 2,097,152 Bytes (8,192 Pages)
 
-uint32_t currentSpiFreqHz = 10000000;
+uint32_t currentSpiFreqHz = 10000000; // Default 10 MHz
 String serialRxBuf = "";
 
-// Non-blocking STOP Command Check
+// Non-blocking check for STOP command from Python GUI
 bool checkStopCommand() {
   while (Serial.available()) {
     char c = Serial.read();
@@ -36,6 +37,7 @@ bool checkStopCommand() {
   return false;
 }
 
+// Poll Busy Bit (SR Bit 0) with non-blocking progress output
 void waitBusyWithProgress() {
   uint8_t status;
   int step = 0;
@@ -69,6 +71,7 @@ void writeEnable() {
   SPI.endTransaction();
 }
 
+// Pattern Generator (Deterministic per offset)
 uint8_t getPatternByte(uint32_t offset, int patternType, uint8_t customVal = 0x00) {
   switch (patternType) {
     case 0: return 0xAA;
@@ -76,7 +79,7 @@ uint8_t getPatternByte(uint32_t offset, int patternType, uint8_t customVal = 0x0
     case 2: return (offset % 2 == 0) ? 0xAA : 0x55;
     case 3: return (uint8_t)(offset & 0xFF);
     case 4: return 0x00;
-    case 5: { // Pseudo-Random PRNG
+    case 5: { // Pseudo-Random Hash
       uint32_t hash = offset ^ 0x5BF03635;
       hash = (hash ^ (hash >> 16)) * 0x45d9f3b;
       hash = (hash ^ (hash >> 16)) * 0x45d9f3b;
@@ -87,6 +90,7 @@ uint8_t getPatternByte(uint32_t offset, int patternType, uint8_t customVal = 0x0
   }
 }
 
+// Write Pattern Engine (Page-Program 256-byte Boundary Aware)
 bool writePattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVal) {
   uint32_t bytesWritten = 0;
   uint8_t pageBuf[256];
@@ -124,6 +128,7 @@ bool writePattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVa
     digitalWrite(CS_PIN, HIGH);
     SPI.endTransaction();
     
+    // Wait until Write Cycle is completed
     uint8_t status;
     do {
       SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
@@ -149,6 +154,7 @@ bool writePattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVa
   return true;
 }
 
+// Read and Verify Pattern Engine (With First Error Address Reporting)
 bool verifyPattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVal, uint32_t &outErrors) {
   outErrors = 0;
   uint32_t firstErrAddr = 0;
@@ -182,6 +188,9 @@ bool verifyPattern(uint32_t addr, uint32_t len, int patternType, uint8_t customV
         actualErr = actual;
       }
       outErrors++;
+      if (outErrors <= 20) {
+        Serial.printf("FAIL_ADDR:0x%06X:EXP_0x%02X_GOT_0x%02X\n", addr + i, expected, actual);
+      }
     }
 
     int currentPct = (int)((uint64_t)(i + 1) * 100 / len);
@@ -203,6 +212,7 @@ bool verifyPattern(uint32_t addr, uint32_t len, int patternType, uint8_t customV
   return true;
 }
 
+// Standalone Erase Commands
 bool eraseChip() {
   Serial.println("PROGRESS:0");
   writeEnable();
@@ -230,6 +240,7 @@ bool eraseSector(uint32_t addr) {
   return true;
 }
 
+// Single-Pattern Continuous Loop Test Engine
 void runLoopTest(int scope, uint32_t addr, uint32_t len, int patType, uint8_t customVal) {
   uint32_t cycle = 1;
   while (true) {
@@ -265,6 +276,7 @@ void runLoopTest(int scope, uint32_t addr, uint32_t len, int patType, uint8_t cu
   }
 }
 
+// 1-Click Automated All-Pattern Full-Chip Sweep Engine
 void runAllPatternSweep(bool isLoop) {
   uint32_t cycle = 1;
   do {
@@ -293,7 +305,7 @@ void runAllPatternSweep(bool isLoop) {
   } while (isLoop);
 }
 
-// Helpers for safe command tokenizing
+// Command Parsing Utilities
 uint32_t parseHex(String str) {
   str.trim();
   if (str.startsWith("0x") || str.startsWith("0X")) {
@@ -317,6 +329,7 @@ int splitString(String src, char delim, String tokens[], int maxTokens) {
   return count;
 }
 
+// Non-blocking Command Tokenizer and Execution Handler
 void processCommand(String cmd) {
   cmd.trim();
   if (cmd.length() == 0) return;
@@ -456,6 +469,8 @@ void setup() {
   Serial.begin(921600);
   pinMode(CS_PIN, OUTPUT);
   digitalWrite(CS_PIN, HIGH);
+
+  // Hardware SPI Setup (VSPI: SCK=18, MISO=19, MOSI=23, CS=5)
   SPI.begin(18, 19, 23, CS_PIN);
   Serial.println("ESP32_READY");
 }
