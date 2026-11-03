@@ -14,12 +14,11 @@
 #define CMD_READ_STATUS  0x05
 #define CMD_READ_CONFIG  0x35
 
-#define FLASH_SIZE_2MB   0x200000  // 2,097,152 Bytes (8,192 Pages)
+#define FLASH_SIZE_2MB   0x200000  // 2,097,152 Bytes (8,192 Pages / 512 Sectors)
 
-uint32_t currentSpiFreqHz = 10000000; // Default 10 MHz
+uint32_t currentSpiFreqHz = 10000000;
 String serialRxBuf = "";
 
-// Non-blocking check for STOP command from Python GUI
 bool checkStopCommand() {
   while (Serial.available()) {
     char c = Serial.read();
@@ -37,7 +36,6 @@ bool checkStopCommand() {
   return false;
 }
 
-// Poll Busy Bit (SR Bit 0) with non-blocking progress output
 void waitBusyWithProgress() {
   uint8_t status;
   int step = 0;
@@ -71,26 +69,27 @@ void writeEnable() {
   SPI.endTransaction();
 }
 
-// Pattern Generator (Deterministic per offset)
+// Pattern Generator (New Ordered Sequence)
+// 0: 0xFF, 1: 0x00, 2: 0xAA, 3: 0x55, 4: Custom, 5: Random, 6: Alt AA/55, 7: Inc
 uint8_t getPatternByte(uint32_t offset, int patternType, uint8_t customVal = 0x00) {
   switch (patternType) {
-    case 0: return 0xAA;
-    case 1: return 0x55;
-    case 2: return (offset % 2 == 0) ? 0xAA : 0x55;
-    case 3: return (uint8_t)(offset & 0xFF);
-    case 4: return 0x00;
+    case 0: return 0xFF; // All 0xFF
+    case 1: return 0x00; // All 0x00
+    case 2: return 0xAA; // All 0xAA
+    case 3: return 0x55; // All 0x55
+    case 4: return customVal; // Custom Hex
     case 5: { // Pseudo-Random Hash
       uint32_t hash = offset ^ 0x5BF03635;
       hash = (hash ^ (hash >> 16)) * 0x45d9f3b;
       hash = (hash ^ (hash >> 16)) * 0x45d9f3b;
       return (uint8_t)((hash ^ (hash >> 16)) & 0xFF);
     }
-    case 6: return customVal;
+    case 6: return (offset % 2 == 0) ? 0xAA : 0x55; // Alt AA/55
+    case 7: return (uint8_t)(offset & 0xFF); // Inc (0x00-0xFF)
     default: return 0xFF;
   }
 }
 
-// Write Pattern Engine (Page-Program 256-byte Boundary Aware)
 bool writePattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVal) {
   uint32_t bytesWritten = 0;
   uint8_t pageBuf[256];
@@ -128,7 +127,6 @@ bool writePattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVa
     digitalWrite(CS_PIN, HIGH);
     SPI.endTransaction();
     
-    // Wait until Write Cycle is completed
     uint8_t status;
     do {
       SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
@@ -154,12 +152,12 @@ bool writePattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVa
   return true;
 }
 
-// Read and Verify Pattern Engine (With First Error Address Reporting)
 bool verifyPattern(uint32_t addr, uint32_t len, int patternType, uint8_t customVal, uint32_t &outErrors) {
   outErrors = 0;
   uint32_t firstErrAddr = 0;
   uint8_t expectedErr = 0, actualErr = 0;
   int lastPct = -1;
+  uint32_t reportedErrs = 0;
 
   Serial.println("PROGRESS:0");
 
@@ -188,8 +186,9 @@ bool verifyPattern(uint32_t addr, uint32_t len, int patternType, uint8_t customV
         actualErr = actual;
       }
       outErrors++;
-      if (outErrors <= 20) {
+      if (reportedErrs < 100) { // Stream up to 100 error lines for GUI navigation mapping
         Serial.printf("FAIL_ADDR:0x%06X:EXP_0x%02X_GOT_0x%02X\n", addr + i, expected, actual);
+        reportedErrs++;
       }
     }
 
@@ -212,7 +211,6 @@ bool verifyPattern(uint32_t addr, uint32_t len, int patternType, uint8_t customV
   return true;
 }
 
-// Standalone Erase Commands
 bool eraseChip() {
   Serial.println("PROGRESS:0");
   writeEnable();
@@ -240,7 +238,6 @@ bool eraseSector(uint32_t addr) {
   return true;
 }
 
-// Single-Pattern Continuous Loop Test Engine
 void runLoopTest(int scope, uint32_t addr, uint32_t len, int patType, uint8_t customVal) {
   uint32_t cycle = 1;
   while (true) {
@@ -276,14 +273,17 @@ void runLoopTest(int scope, uint32_t addr, uint32_t len, int patType, uint8_t cu
   }
 }
 
-// 1-Click Automated All-Pattern Full-Chip Sweep Engine
 void runAllPatternSweep(bool isLoop) {
   uint32_t cycle = 1;
+  int sweepPats[] = {0, 1, 2, 3, 4, 5, 6, 7};
+  int totalPats = 8;
+
   do {
     if (checkStopCommand()) { Serial.println("ABORTED"); break; }
     Serial.printf("SWEEP_CYCLE_START:%u\n", cycle);
 
-    for (int pat = 0; pat <= 5; pat++) {
+    for (int idx = 0; idx < totalPats; idx++) {
+      int pat = sweepPats[idx];
       if (checkStopCommand()) { Serial.println("ABORTED"); return; }
       Serial.printf("PAT_START:%d\n", pat);
 
@@ -305,7 +305,6 @@ void runAllPatternSweep(bool isLoop) {
   } while (isLoop);
 }
 
-// Command Parsing Utilities
 uint32_t parseHex(String str) {
   str.trim();
   if (str.startsWith("0x") || str.startsWith("0X")) {
@@ -329,7 +328,6 @@ int splitString(String src, char delim, String tokens[], int maxTokens) {
   return count;
 }
 
-// Non-blocking Command Tokenizer and Execution Handler
 void processCommand(String cmd) {
   cmd.trim();
   if (cmd.length() == 0) return;
@@ -442,7 +440,7 @@ void processCommand(String cmd) {
     uint32_t addr = parseHex(tokens[1]);
     int len = tokens[2].toInt();
     if (len <= 0) len = 16;
-    if (len > 512) len = 512;
+    if (len > 4096) len = 4096;
 
     Serial.println("PROGRESS:0");
     SPI.beginTransaction(SPISettings(currentSpiFreqHz, MSBFIRST, SPI_MODE0));
@@ -469,8 +467,6 @@ void setup() {
   Serial.begin(921600);
   pinMode(CS_PIN, OUTPUT);
   digitalWrite(CS_PIN, HIGH);
-
-  // Hardware SPI Setup (VSPI: SCK=18, MISO=19, MOSI=23, CS=5)
   SPI.begin(18, 19, 23, CS_PIN);
   Serial.println("ESP32_READY");
 }
