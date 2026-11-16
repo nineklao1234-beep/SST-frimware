@@ -2,7 +2,7 @@
 #include <SPI.h>
 
 // =========================================================================
-// HARDWARE PIN DEFINITIONS (ESP32 <-> SST26VF016B)
+// HARDWARE PIN DEFINITIONS (ESP32 <-> SST26VF Family)
 // =========================================================================
 #define PIN_CS    5
 #define PIN_SCK   18
@@ -11,8 +11,11 @@
 #define PIN_WP    4   // Write Protect (High = Normal Mode)
 #define PIN_HOLD  2   // Hold (High = Normal Mode)
 
-// Flash Memory Specification (SST26VF016B: 2MB / 16Mbit)
-#define FLASH_SIZE_BYTES  0x200000 // 2,097,152 Bytes
+// =========================================================================
+// FLASH MEMORY SPECIFICATION (DYNAMIC CAPACITY SUPPORT)
+// Supports SST26VF080B (1MB), SST26VF016B (2MB), SST26VF032B (4MB), SST26VF064B (8MB)
+// =========================================================================
+uint32_t flash_size_bytes = 0x200000; // Default: 2MB / 16Mbit
 #define SECTOR_SIZE_BYTES 4096     // 4 KB
 #define PAGE_SIZE_BYTES   256      // 256 Bytes
 #define BLOCK_BUF_SIZE    4096     // High-Speed Block Buffer (4KB)
@@ -26,20 +29,45 @@ static uint8_t rx_buf[BLOCK_BUF_SIZE];
 static uint8_t tx_buf[BLOCK_BUF_SIZE];
 
 // =========================================================================
-// SST26VF016B SPI INSTRUCTION CODES
+// ABORT FLAG (STOP handling)
+// =========================================================================
+static bool g_abort = false;
+
+// คืน true ถ้าได้รับ STOP (พิมพ์ ABORTED แค่ครั้งเดียวตอนตรวจพบ)
+static bool checkStop() {
+    if (g_abort) return true;
+    if (Serial.available()) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+        if (cmd == "STOP") {
+            g_abort = true;
+            Serial.println("ABORTED");
+            return true;
+        }
+    }
+    return false;
+}
+
+// =========================================================================
+// SST26VF SPI INSTRUCTION CODES
 // =========================================================================
 #define CMD_READ_ID       0x9F
 #define CMD_READ_STATUS   0x05
 #define CMD_READ_CONFIG   0x35
 #define CMD_WRITE_ENABLE  0x06
 #define CMD_GLOBAL_UNLOCK 0x98
+#define CMD_READ_BPR      0x72   // Read Block-Protection Register
 #define CMD_SECTOR_ERASE  0x20
 #define CMD_CHIP_ERASE    0xC7
 #define CMD_PAGE_PROGRAM  0x02
 #define CMD_READ_DATA     0x03
 
+// ความยาว BPR: ตรวจกับ datasheet ของรุ่นที่ใช้ (016B = 18 byte ตามที่เข้าใจ)
+// ถ้ารุ่นอื่นสั้นกว่านี้ ให้ปรับค่า ไม่งั้นไบต์ส่วนเกินอาจทำให้เข้าใจว่ายัง lock
+#define BPR_LEN           18
+
 // =========================================================================
-// FUNCTION PROTOTYPES (FORWARD DECLARATIONS FOR PLATFORMIO)
+// FUNCTION PROTOTYPES
 // =========================================================================
 void updateSpiSettings(uint32_t freq_hz);
 uint8_t readStatusRegister();
@@ -59,7 +87,6 @@ void readDataHex(uint32_t start_addr, uint32_t len);
 // =========================================================================
 // HELPER & LOW-LEVEL FUNCTIONS
 // =========================================================================
-
 void updateSpiSettings(uint32_t freq_hz) {
     spi_freq = freq_hz;
     spiSettings = SPISettings(spi_freq, MSBFIRST, SPI_MODE0);
@@ -105,14 +132,7 @@ bool waitBusyWithProgress(uint32_t timeout_ms, uint32_t total_expected_ms) {
             return false;
         }
 
-        if (Serial.available()) {
-            String cmd = Serial.readStringUntil('\n');
-            cmd.trim();
-            if (cmd == "STOP") {
-                Serial.println("ABORTED");
-                return false;
-            }
-        }
+        if (checkStop()) return false;
 
         if (total_expected_ms > 0) {
             int pct = (elapsed * 100) / total_expected_ms;
@@ -128,14 +148,41 @@ bool waitBusyWithProgress(uint32_t timeout_ms, uint32_t total_expected_ms) {
     return true;
 }
 
+// Global Block-Protection Unlock + ยืนยันผลจริงด้วยการอ่าน BPR
 bool unlockProtection() {
     writeEnable();
+    if (!(readStatusRegister() & 0x02)) {          // WEL ต้องเป็น 1
+        Serial.println("ERR:WEL_NOT_SET");
+        return false;
+    }
+
     SPI.beginTransaction(spiSettings);
     digitalWrite(PIN_CS, LOW);
     SPI.transfer(CMD_GLOBAL_UNLOCK);
     digitalWrite(PIN_CS, HIGH);
     SPI.endTransaction();
-    delay(5);
+    if (!waitBusyWithProgress(100)) return false;
+
+    uint8_t bpr[BPR_LEN];
+    SPI.beginTransaction(spiSettings);
+    digitalWrite(PIN_CS, LOW);
+    SPI.transfer(CMD_READ_BPR);
+    for (int i = 0; i < BPR_LEN; i++) bpr[i] = SPI.transfer(0x00);
+    digitalWrite(PIN_CS, HIGH);
+    SPI.endTransaction();
+
+    bool still_locked = false;
+    for (int i = 0; i < BPR_LEN; i++) {
+        if (bpr[i] != 0x00) still_locked = true;
+    }
+
+    if (still_locked) {
+        Serial.print("ERR:UNLOCK_FAILED:BPR=");
+        for (int i = 0; i < BPR_LEN; i++) Serial.printf("%02X", bpr[i]);
+        Serial.println();
+        return false;
+    }
+
     Serial.println("UNLOCK:OK");
     return true;
 }
@@ -204,7 +251,6 @@ uint8_t getPatternByte(uint32_t offset, uint8_t pat_type, uint8_t custom_hex) {
 // =========================================================================
 // WRITE ENGINE
 // =========================================================================
-
 bool writePage(uint32_t addr, uint8_t *data, uint16_t len) {
     writeEnable();
 
@@ -229,14 +275,7 @@ bool writePatternRange(uint32_t start_addr, uint32_t len, uint8_t pat_type, uint
     int last_pct = -1;
 
     while (written < len) {
-        if (Serial.available()) {
-            String cmd = Serial.readStringUntil('\n');
-            cmd.trim();
-            if (cmd == "STOP") {
-                Serial.println("ABORTED");
-                return false;
-            }
-        }
+        if (checkStop()) return false;
 
         uint32_t curr_addr = start_addr + written;
         uint16_t chunk = min((uint32_t)PAGE_SIZE_BYTES, len - written);
@@ -262,28 +301,30 @@ bool writePatternRange(uint32_t start_addr, uint32_t len, uint8_t pat_type, uint
 }
 
 // =========================================================================
-// HIGH-SPEED BLOCK VERIFY ENGINE (SPI.transferBytes + UART Rate Limit Filter)
+// HIGH-SPEED BLOCK VERIFY ENGINE
+// ส่ง FAIL_ADDR ต่อ 1 page พร้อมจำนวน byte ที่ผิดจริง:
+//   FAIL_ADDR:0xADDR:COUNT:Read=0xXX,Exp=0xYY   (ADDR = byte แรกที่ผิดใน page)
 // =========================================================================
-
 bool verifyPatternRange(uint32_t start_addr, uint32_t len, uint8_t pat_type, uint8_t custom_hex) {
-    uint32_t err_count = 0;
-    uint32_t first_fail_addr = 0;
+    uint32_t err_count = 0, first_fail_addr = 0, verified_bytes = 0;
     int last_pct = -1;
-    uint32_t verified_bytes = 0;
-    
-    int32_t last_reported_page = -1;
+
+    int32_t  cur_page = -1;
+    uint16_t page_cnt = 0;
+    uint32_t pf_addr = 0;
+    uint8_t  pf_rd = 0, pf_ex = 0;
+    auto flushPage = [&]() {
+        if (page_cnt) {
+            Serial.printf("FAIL_ADDR:0x%06X:%u:Read=0x%02X,Exp=0x%02X\n",
+                          (unsigned)pf_addr, (unsigned)page_cnt, pf_rd, pf_ex);
+            page_cnt = 0;
+        }
+    };
 
     memset(tx_buf, 0x00, sizeof(tx_buf));
 
     while (verified_bytes < len) {
-        if (Serial.available()) {
-            String cmd = Serial.readStringUntil('\n');
-            cmd.trim();
-            if (cmd == "STOP") {
-                Serial.println("ABORTED");
-                return false;
-            }
-        }
+        if (checkStop()) { flushPage(); return false; }
 
         uint32_t curr_addr = start_addr + verified_bytes;
         uint32_t chunk = min((uint32_t)BLOCK_BUF_SIZE, len - verified_bytes);
@@ -294,56 +335,50 @@ bool verifyPatternRange(uint32_t start_addr, uint32_t len, uint8_t pat_type, uin
         SPI.transfer((curr_addr >> 16) & 0xFF);
         SPI.transfer((curr_addr >> 8) & 0xFF);
         SPI.transfer(curr_addr & 0xFF);
-
         SPI.transferBytes(tx_buf, rx_buf, chunk);
-
         digitalWrite(PIN_CS, HIGH);
         SPI.endTransaction();
 
         for (uint32_t i = 0; i < chunk; i++) {
             uint32_t abs_addr = curr_addr + i;
             uint8_t exp_b = getPatternByte(abs_addr, pat_type, custom_hex);
-
             if (rx_buf[i] != exp_b) {
-                if (err_count == 0) {
-                    first_fail_addr = abs_addr;
-                }
+                int32_t pg = abs_addr >> 8;
+                if (pg != cur_page) { flushPage(); cur_page = pg; }
+                if (page_cnt == 0) { pf_addr = abs_addr; pf_rd = rx_buf[i]; pf_ex = exp_b; }
+                page_cnt++;
+                if (err_count == 0) first_fail_addr = abs_addr;
                 err_count++;
-
-                int32_t curr_page = abs_addr / 256;
-                if (curr_page != last_reported_page) {
-                    last_reported_page = curr_page;
-                    Serial.printf("FAIL_ADDR:0x%06X:Read=0x%02X,Exp=0x%02X\n", abs_addr, rx_buf[i], exp_b);
-                }
             }
         }
 
         verified_bytes += chunk;
-
         int pct = (verified_bytes * 100) / len;
         if (pct != last_pct) {
             Serial.printf("PROGRESS:%d\n", pct);
             last_pct = pct;
         }
     }
+    flushPage();
 
     if (err_count == 0) {
         Serial.println("VERIFY:OK");
         return true;
-    } else {
-        Serial.printf("VERIFY:FAIL:%d:0x%06X\n", err_count, first_fail_addr);
-        return false;
     }
+    Serial.printf("VERIFY:FAIL:%lu:0x%06X\n", (unsigned long)err_count, (unsigned)first_fail_addr);
+    return false;
 }
 
 // =========================================================================
 // OPTIMIZED ALL-PATTERN SWEEP ENGINE
+// หมายเหตุ: pattern 4 ใช้ custom = 0xA5 (ต้องตรงกับ SWEEP_CUSTOM_HEX ใน GUI)
 // =========================================================================
 void runAllPatternSweep(bool is_loop) {
     uint8_t pat_list[] = {0, 1, 2, 3, 4, 5, 6, 7};
     uint8_t custom_vals[] = {0x00, 0x00, 0x00, 0x00, 0xA5, 0x00, 0x00, 0x00};
-
     uint32_t cycle_cnt = 1;
+
+    uint32_t total_sectors = flash_size_bytes / SECTOR_SIZE_BYTES;
 
     while (true) {
         Serial.printf("SWEEP_CYCLE_START:%d\n", cycle_cnt);
@@ -355,23 +390,23 @@ void runAllPatternSweep(bool is_loop) {
             Serial.printf("PAT_START:%d\n", pat);
 
             Serial.println("PHASE:ERASING");
-            for (uint32_t sec = 0; sec < 512; sec++) {
+            for (uint32_t sec = 0; sec < total_sectors; sec++) {
                 uint32_t sec_addr = sec * SECTOR_SIZE_BYTES;
                 if (!eraseSector(sec_addr)) {
                     return;
                 }
-                int pct = ((sec + 1) * 100) / 512;
+                int pct = ((sec + 1) * 100) / total_sectors;
                 Serial.printf("PROGRESS:%d\n", pct);
             }
 
             Serial.println("PHASE:WRITING");
-            if (!writePatternRange(0x000000, FLASH_SIZE_BYTES, pat, c_val)) {
+            if (!writePatternRange(0x000000, flash_size_bytes, pat, c_val)) {
                 return;
             }
 
             Serial.println("PHASE:VERIFYING");
-            if (!verifyPatternRange(0x000000, FLASH_SIZE_BYTES, pat, c_val)) {
-                if (Serial.available()) return;
+            if (!verifyPatternRange(0x000000, flash_size_bytes, pat, c_val)) {
+                if (g_abort) return;     // STOP ระหว่าง verify -> เลิก sweep จริง
             }
 
             Serial.printf("PAT_DONE:%d\n", pat);
@@ -409,9 +444,12 @@ void readDataHex(uint32_t start_addr, uint32_t len) {
     Serial.println();
 }
 
+// =========================================================================
+// SETUP & MAIN LOOP
+// =========================================================================
 void setup() {
     Serial.begin(921600);
-    
+
     pinMode(PIN_CS, OUTPUT);
     digitalWrite(PIN_CS, HIGH);
 
@@ -429,6 +467,7 @@ void loop() {
     if (Serial.available()) {
         String line = Serial.readStringUntil('\n');
         line.trim();
+        g_abort = false;   // เริ่มคำสั่งใหม่ = เคลียร์ flag
 
         if (line == "READ_ID") {
             SPI.beginTransaction(spiSettings);
@@ -440,7 +479,27 @@ void loop() {
             digitalWrite(PIN_CS, HIGH);
             SPI.endTransaction();
 
+            // Auto-Detect capacity for SST26VF Family (0xBF 0x26)
+            if (mfg == 0xBF && type == 0x26) {
+                switch (cap) {
+                    case 0x40: flash_size_bytes = 0x100000; break; // 8 Mbit (1MB)
+                    case 0x41: flash_size_bytes = 0x200000; break; // 16 Mbit (2MB)
+                    case 0x42: flash_size_bytes = 0x400000; break; // 32 Mbit (4MB)
+                    case 0x43: flash_size_bytes = 0x800000; break; // 64 Mbit (8MB)
+                    default: break;
+                }
+            }
+
             Serial.printf("ID:%02X %02X %02X\n", mfg, type, cap);
+
+        } else if (line.startsWith("SET_CAPACITY:")) {
+            uint32_t cap_bytes = strtoul(line.substring(13).c_str(), NULL, 16);
+            if (cap_bytes >= 0x100000 && cap_bytes <= 0x800000) {
+                flash_size_bytes = cap_bytes;
+                Serial.println("CAPACITY:OK");
+            } else {
+                Serial.println("CAPACITY:ERR");
+            }
 
         } else if (line == "UNLOCK") {
             unlockProtection();
@@ -489,7 +548,7 @@ void loop() {
             uint8_t pat = line.substring(15, p1).toInt();
             uint8_t c_val = strtoul(line.substring(p1 + 1).c_str(), NULL, 16);
 
-            writePatternRange(0x000000, FLASH_SIZE_BYTES, pat, c_val);
+            writePatternRange(0x000000, flash_size_bytes, pat, c_val);
 
         } else if (line.startsWith("VERIFY:")) {
             int p1 = line.indexOf(':', 7);
@@ -508,7 +567,7 @@ void loop() {
             uint8_t pat = line.substring(16, p1).toInt();
             uint8_t c_val = strtoul(line.substring(p1 + 1).c_str(), NULL, 16);
 
-            verifyPatternRange(0x000000, FLASH_SIZE_BYTES, pat, c_val);
+            verifyPatternRange(0x000000, flash_size_bytes, pat, c_val);
 
         } else if (line.startsWith("ALL_PAT_START:")) {
             bool is_loop = line.substring(14).toInt() == 1;
@@ -516,7 +575,3 @@ void loop() {
         }
     }
 }
-
-
-
-// มีบั็คตรง เปลี่ยนไอซีและ ต้องเปิดปิดโปรแกรมใหม่ทุกครั้ง + เพิ่มอ่านเป็นค่า ไบนารี่ไปด้วย

@@ -1,27 +1,32 @@
 import time
 import csv
+import bisect
+import os
+import hashlib
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 import serial
 import serial.tools.list_ports
 
+# รองรับเฉพาะ SST26VF (firmware ใช้คำสั่ง Global Unlock 0x98 ซึ่งเป็นของ SST26 เท่านั้น)
+# ตรวจรหัส capacity กับ datasheet อีกครั้ง (BF 26 40 ยึดตามที่ firmware ระบุ)
 JEDEC_DB = {
-    "BF 26 41": "Microchip / SST SST26VF016B (2MB / 16Mbit)",
-    "BF 25 41": "Microchip / SST SST25VF016B (2MB / 16Mbit)",
-    "EF 40 15": "Winbond W25Q16 (2MB / 16Mbit)",
-    "EF 40 16": "Winbond W25Q32 (4MB / 32Mbit)",
-    "C2 20 15": "Macronix MX25L1606E (2MB / 16Mbit)",
-    "1C 20 15": "EON EN25Q16 (2MB / 16Mbit)",
-    "20 80 15": "Micron M25PE16 (2MB / 16Mbit)"  # FIX: เดิมระบุเป็น N25Q032 ซึ่งน่าจะผิด (ควรเทียบ datasheet อีกครั้ง)
+    "BF 26 40": "Microchip SST26VF080B (1MB / 8Mbit)",
+    "BF 26 41": "Microchip SST26VF016B (2MB / 16Mbit)",
+    "BF 26 42": "Microchip SST26VF032B (4MB / 32Mbit)",
+    "BF 26 43": "Microchip SST26VF064B (8MB / 64Mbit)",
 }
+CHIP_BY_CAP = {0x40: 0x100000, 0x41: 0x200000, 0x42: 0x400000, 0x43: 0x800000}
+DEFAULT_CHIP_SIZE = 0x200000
+SWEEP_CUSTOM_HEX = "A5"   # ต้องตรงกับ custom_vals[4] ใน firmware (runAllPatternSweep)
 
-CHIP_SIZE = 0x200000  # 2MB
+IO_READ_CHUNK = 4096     # ขนาดต่อคำสั่ง READ ตอน Dump/Compare (เท่ากับที่ Hex Viewer ใช้อยู่)
 
 
 class FlashProgrammerGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("SST26VF016B Tester & Failure Analysis (FA) Programmer - ESP32")
+        self.root.title("SST26VF Tester & Failure Analysis (FA) Programmer - ESP32")
         self.root.geometry("1100x800")
         self.root.resizable(False, False)
 
@@ -29,10 +34,14 @@ class FlashProgrammerGUI:
         self.stop_requested = False
         self.jedec_read_valid = False  # Track JEDEC ID requirement
         self.is_unlocked = False       # Track Protection status
-        self.ui_ready = False          # FIX: กัน event ตอนสร้าง UI ยังไม่เสร็จ
-        self.busy = False              # FIX: กันสั่งงานซ้อนระหว่างที่คำสั่งกำลังรัน
+        self.ui_ready = False          # กัน event ตอนสร้าง UI ยังไม่เสร็จ
+        self.busy = False              # กันสั่งงานซ้อนระหว่างที่คำสั่งกำลังรัน
         self.closing = False
-        self.fa_unsaved = False        # มีผล FA ที่ยังไม่ได้ export หรือไม่ (ใช้ตอนกด New Chip)
+        self.job_running = False       # งาน Data I/O ที่ Python คุมเอง (หลายคำสั่งต่อเนื่อง)
+        self.fa_unsaved = False        # มีผล FA ที่ยังไม่ได้ export หรือไม่
+
+        # ขนาดชิปปัจจุบัน (ปรับตาม JEDEC ID ตอน Read ID)
+        self.chip_size = DEFAULT_CHIP_SIZE
 
         # Global Central Active Target
         self.target_hex_addr = 0x000000
@@ -40,13 +49,16 @@ class FlashProgrammerGUI:
         self.bytes_per_hex_view = 256
 
         # Multi-page Failure Analysis Data Store
-        self.failed_pages = []            # Unique page start addresses
-        self.failed_page_err_counts = {}  # Page Addr -> Error Count
+        self.failed_pages = []            # Unique page start addresses (เรียงตามลำดับที่พบ)
+        self.failed_page_err_counts = {}  # Page Addr -> Error Count (ใช้เป็น set lookup O(1) ด้วย)
         self.failed_page_samples = {}     # Page Addr -> First Mismatch detail
         self.tested_sectors = set()       # Set of tested sector indices
         self.selected_bitmap_sector = 0
+
+        # เก็บทั้ง pattern และ "ช่วง address" ที่ verify จริง ใช้ไฮไลต์ใน Hex Viewer
         self.last_verified_pat_type = None
         self.last_verified_custom_hex = "AA"
+        self.last_verified_range = None   # (start_addr, end_addr_exclusive)
 
         # Loop Test State Storage
         self.loop_running = False
@@ -141,7 +153,7 @@ class FlashProgrammerGUI:
         self.lbl_phase.pack(side="right", padx=5)
 
         # =========================================================================
-        # TAB SYSTEM ARCHITECTURE (5 Dedicated Tabs)
+        # TAB SYSTEM ARCHITECTURE
         # =========================================================================
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=5)
@@ -167,21 +179,57 @@ class FlashProgrammerGUI:
         self.notebook.add(self.tab_loop, text=" 🔁 Loop ")
         self.setup_tab_loop()
 
+        self.tab_io = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_io, text=" 💾 Data I/O ")
+        self.setup_tab_io()
+
         self.refresh_ports()
 
-        # FIX: ปิดหน้าต่างอย่างปลอดภัย (หยุด loop + ปิด serial)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.ui_ready = True
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # CHIP SIZE HELPERS
+    # =========================================================================
+    @property
+    def n_sectors(self):
+        return self.chip_size // 4096
+
+    @property
+    def n_pages(self):
+        return self.chip_size // 256
+
+    @property
+    def chip_label(self):
+        return f"{self.chip_size // 0x100000}MB"
+
+    def apply_chip_size(self, size):
+        """ ปรับทุกอย่างที่ผูกกับขนาดชิป (เรียกหลัง Read ID สำเร็จ) """
+        if size == self.chip_size:
+            return
+        self.chip_size = size
+        full = f"Entire Chip ({self.chip_label})"
+        self.scope_cb['values'] = ["Selected Range", full]
+        if "Entire" in self.scope_cb.get():
+            self.scope_cb.set(full)
+        self.btn_io_full.config(text=f"Full Chip ({self.chip_label})")
+        self.selected_bitmap_sector = 0
+        self.lbl_bitmap_selected.config(text="Selected: Sector 0 (0x000000 - 0x000FFF)")
+        self.clear_fa_data()
+        self.update_fa_table_data()
+        self.render_bitmap_grid()
+        self.set_active_target(0, 4096)
+        self.sync_target_to_ops_ui()
+
+    # =========================================================================
     # COMMON HELPERS
-    # -------------------------------------------------------------------------
+    # =========================================================================
     def on_close(self):
         self.closing = True
         self.stop_requested = True
         self.loop_running = False
-        if self.busy:
-            # รอให้ลูปที่กำลังรันอยู่จบก่อน แล้วค่อยปิด
+        if self.busy or self.job_running:
+            # รอให้คำสั่งที่กำลังรันอยู่จบก่อน แล้วค่อยปิด
             self.root.after(200, self.on_close)
             return
         try:
@@ -196,7 +244,7 @@ class FlashProgrammerGUI:
 
     def ensure_idle(self):
         """ กันสั่งงานซ้อน (root.update() ทำให้กดปุ่มอื่นได้ระหว่างรัน) """
-        if self.busy or self.loop_running:
+        if self.busy or self.loop_running or self.job_running:
             messagebox.showwarning("Busy", "มีงานกำลังทำงานอยู่ กรุณารอให้เสร็จหรือกด STOP ก่อนครับ")
             return False
         return True
@@ -210,9 +258,35 @@ class FlashProgrammerGUI:
             default="no")
 
     def validate_target(self):
-        if self.target_len <= 0 or self.target_hex_addr + self.target_len > CHIP_SIZE:
-            messagebox.showerror("Error", "Address + Length เกินขนาด chip (2MB) หรือ Length เป็น 0")
+        if self.target_len <= 0 or self.target_hex_addr + self.target_len > self.chip_size:
+            messagebox.showerror("Error", f"Address + Length เกินขนาด chip ({self.chip_label}) หรือ Length เป็น 0")
             return False
+        return True
+
+    def read_target_entries(self, addr_entry, len_entry=None):
+        """ อ่าน + validate address/length จากช่องกรอกก่อนตั้ง target (ไม่ clamp เงียบๆ)
+            len_entry=None -> ตรวจเฉพาะ address (เช่น Erase Sector) """
+        try:
+            addr = int(addr_entry.get().strip(), 16)
+        except ValueError:
+            messagebox.showerror("Error", "Invalid Hex Address format")
+            return False
+        if addr < 0 or addr >= self.chip_size:
+            messagebox.showerror("Error", f"Address 0x{addr:X} เกินขนาด chip (0x000000 - 0x{self.chip_size - 1:06X})")
+            return False
+
+        if len_entry is not None:
+            ln = len_entry.get().strip()
+            if not ln.isdigit():
+                messagebox.showerror("Error", "Length ต้องเป็นตัวเลขจำนวนเต็ม")
+                return False
+            self.target_len = int(ln)
+            self.target_hex_addr = addr
+            self.update_target_info_labels()
+            return self.validate_target()
+
+        self.target_hex_addr = addr
+        self.update_target_info_labels()
         return True
 
     @staticmethod
@@ -228,6 +302,21 @@ class FlashProgrammerGUI:
         cnt = parts[2] if len(parts) > 2 else "?"
         where = parts[3] if len(parts) > 3 else "?"
         return cnt, where
+
+    def set_verified(self, pat_type, custom_hex, addr, length):
+        self.last_verified_pat_type = pat_type
+        self.last_verified_custom_hex = custom_hex
+        self.last_verified_range = (addr, addr + length)
+
+    def clear_verified(self):
+        self.last_verified_pat_type = None
+        self.last_verified_range = None
+
+    def mark_tested(self, addr, length):
+        if length <= 0:
+            return
+        for s in range(addr // 4096, (addr + length - 1) // 4096 + 1):
+            self.tested_sectors.add(s)
 
     def update_lock_ui(self, is_unlocked):
         self.is_unlocked = is_unlocked
@@ -250,6 +339,10 @@ class FlashProgrammerGUI:
         self.jedec_read_valid = False
         self.loop_running = False
         self.update_lock_ui(False)
+        self.lbl_jedec.config(text="JEDEC ID: -- -- --")
+        self.lbl_device.config(text="Device: -- (กด Read JEDEC ID ใหม่)", foreground="#FF9500")
+        self.lbl_stat_reg.config(text="SR(0x05): --")
+        self.lbl_cfg_reg.config(text="CR(0x35): --")
         if self.ser and self.ser.is_open:
             try:
                 self.ser.reset_input_buffer()
@@ -265,7 +358,6 @@ class FlashProgrammerGUI:
         if not self.ensure_idle():
             return
 
-        # ถ้ามีผล FA ที่ยังไม่ได้ export ให้ถามก่อน
         if self.failed_pages and self.fa_unsaved:
             ans = messagebox.askyesnocancel(
                 "🆕 New Chip",
@@ -283,7 +375,7 @@ class FlashProgrammerGUI:
         self.clear_fa_data()
         self.update_fa_table_data()
         self.lbl_fa_status.config(text="STATUS: UNTESTED / NO ERRORS RECORDED", foreground="#007ACC")
-        self.last_verified_pat_type = None
+        self.clear_verified()
         self.last_verified_custom_hex = "AA"
 
         self.selected_bitmap_sector = 0
@@ -344,11 +436,12 @@ class FlashProgrammerGUI:
                 self.ops_log(f"[ERROR] Failed to send STOP command: {e}")
 
     def drain_after_stop(self, wait=1.0):
-        """ FIX: รอ ABORTED จาก ESP32 แล้วเคลียร์ buffer กันไปรบกวนคำสั่งถัดไป """
+        """ รอ ABORTED จาก ESP32 แล้วเคลียร์ buffer กันไปรบกวนคำสั่งถัดไป """
         try:
+            buf = bytearray()
             end = time.time() + wait
             while time.time() < end:
-                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                line = self.read_line(self.ser, buf)
                 if line == "ABORTED":
                     break
             self.ser.reset_input_buffer()
@@ -374,10 +467,42 @@ class FlashProgrammerGUI:
             self.jedec_read_valid = False
             self.update_lock_ui(False)
 
+    def handle_disconnect(self, err=None):
+        """ สาย USB หลุด/พอร์ตพัง -> หยุด loop, ปิดพอร์ต, เคลียร์ self.ser """
+        self.loop_running = False
+        try:
+            if self.ser:
+                self.ser.close()
+        except Exception:
+            pass
+        self.ser = None
+        if self.closing:
+            return
+        if err is not None:
+            self.ops_log(f"[ERROR] Communication failure: {err}")
+            self.loop_log(f"🔌 [ERROR] Communication failure: {err}")
+        self.set_led_status(False)
+
+    # -------------------------------------------------------------------------
+    # SERIAL LINE READER (สะสม buffer จนเจอ '\n' ไม่ตัดบรรทัดตอน timeout)
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def read_line(ser, buf):
+        while True:
+            i = buf.find(b"\n")
+            if i >= 0:
+                line = bytes(buf[:i])
+                del buf[:i + 1]
+                return line.decode('utf-8', errors='ignore').strip()
+            chunk = ser.read(max(1, ser.in_waiting))
+            if not chunk:
+                return ""  # timeout: ข้อมูลที่ยังไม่ครบบรรทัดยังเก็บอยู่ใน buf
+            buf.extend(chunk)
+
     def set_active_target(self, addr, length=None):
-        """ Global Central Target Handler """
-        # FIX: clamp แทนการ mask (เดิม 0x200000 จะวนกลับเป็น 0x000000 เงียบๆ)
-        self.target_hex_addr = max(0, min(addr, CHIP_SIZE - 1))
+        """ Global Central Target Handler (clamp เฉพาะใช้กับการนำทาง/พิมพ์ระหว่างกรอก
+            การสั่งงานจริงต้องผ่าน read_target_entries ที่ validate ก่อน) """
+        self.target_hex_addr = max(0, min(addr, self.chip_size - 1))
         if length is not None:
             self.target_len = length
         self.update_target_info_labels()
@@ -386,7 +511,7 @@ class FlashProgrammerGUI:
         addr = self.target_hex_addr
         sec = addr // 4096
         page = addr // 256
-        info_str = f"Sector: {sec} (0-511)  |  Page: {page} (0-8191)"
+        info_str = f"Sector: {sec} (0-{self.n_sectors - 1})  |  Page: {page} (0-{self.n_pages - 1})"
 
         if hasattr(self, 'lbl_ops_sec_page'):
             self.lbl_ops_sec_page.config(text=info_str)
@@ -395,6 +520,8 @@ class FlashProgrammerGUI:
             end_addr = addr + self.bytes_per_hex_view - 1
             self.lbl_hex_page_info.config(text=f"Range: 0x{addr:06X} - 0x{end_addr:06X}")
             self.update_fail_nav_label()
+        if hasattr(self, 'lbl_io_sec_page'):
+            self.lbl_io_sec_page.config(text=info_str)
         if hasattr(self, 'lbl_loop_sec_page'):
             self.lbl_loop_sec_page.config(text=info_str)
             end_addr = addr + self.target_len - 1
@@ -404,7 +531,6 @@ class FlashProgrammerGUI:
         if not self.ui_ready:
             return
         selected_tab = self.notebook.tab(self.notebook.select(), "text").strip()
-        # FIX: เดิมเช็ก "Targeted Loop" ซึ่งไม่ตรงกับชื่อแท็บจริง " 🔁 Loop "
         if "Loop" in selected_tab:
             self.sync_target_to_loop_ui()
         elif "Hex Viewer" in selected_tab:
@@ -413,6 +539,8 @@ class FlashProgrammerGUI:
             self.update_target_info_labels()
         elif "Memory Operations" in selected_tab:
             self.sync_target_to_ops_ui()
+        elif "Data I/O" in selected_tab:
+            self.sync_target_to_io_ui()
 
     def sync_target_to_ops_ui(self):
         self.ent_addr.config(state="normal")
@@ -425,7 +553,7 @@ class FlashProgrammerGUI:
         self.update_target_info_labels()
 
     def goto_hex_viewer(self, addr, length):
-        """ FIX: ตั้งค่า target / ขนาด view / ช่อง address ให้เรียบร้อยก่อนโหลด """
+        """ ตั้งค่า target / ขนาด view / ช่อง address ให้เรียบร้อยก่อนโหลด """
         self.set_active_target(addr, length)
         if length >= 4096:
             self.hex_view_size_cb.current(1)
@@ -439,9 +567,9 @@ class FlashProgrammerGUI:
         self.update_target_info_labels()
         self.load_hex_view_page()
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # TAB 1: MEMORY OPERATIONS PANEL
-    # -------------------------------------------------------------------------
+    # =========================================================================
     def setup_tab_ops(self):
         cfg_frame = ttk.LabelFrame(self.tab_ops, text=" ⚙️ Operation & Memory Targeting Parameters ")
         cfg_frame.pack(fill="x", padx=10, pady=5)
@@ -460,7 +588,7 @@ class FlashProgrammerGUI:
 
         ttk.Label(cfg_frame, text="Scope:").grid(row=0, column=2, padx=5, pady=6, sticky="e")
         self.scope_cb = ttk.Combobox(cfg_frame, width=18, state="readonly")
-        self.scope_cb['values'] = ["Selected Range", "Entire Chip (2MB)"]
+        self.scope_cb['values'] = ["Selected Range", f"Entire Chip ({self.chip_label})"]
         self.scope_cb.current(0)
         self.scope_cb.grid(row=0, column=3, padx=5, pady=6, sticky="w")
         self.scope_cb.bind("<<ComboboxSelected>>", self.update_param_states)
@@ -549,7 +677,7 @@ class FlashProgrammerGUI:
             self.ent_len.config(state="normal")
 
         if "Sweep" in mode:
-            self.scope_cb.set("Entire Chip (2MB)")
+            self.scope_cb.set(f"Entire Chip ({self.chip_label})")
             self.pat_cb.config(state="disabled")
         else:
             self.pat_cb.config(state="readonly")
@@ -561,9 +689,9 @@ class FlashProgrammerGUI:
         else:
             self.ent_custom_hex.config(state="disabled")
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # TAB 2: DEDICATED FAILURE ANALYSIS TAB
-    # -------------------------------------------------------------------------
+    # =========================================================================
     def setup_tab_fa(self):
         summary_frame = ttk.LabelFrame(self.tab_fa, text=" 📈 Verification Yield & Failure Overview ")
         summary_frame.pack(fill="x", padx=10, pady=5)
@@ -575,11 +703,11 @@ class FlashProgrammerGUI:
         self.lbl_fa_status.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
 
         ttk.Label(sub_grid, text="Failed Pages:").grid(row=1, column=0, sticky="e", padx=4)
-        self.lbl_fa_failed_pages = ttk.Label(sub_grid, text="0 / 8,192 Pages", font=("Consolas", 9, "bold"))
+        self.lbl_fa_failed_pages = ttk.Label(sub_grid, text=f"0 / {self.n_pages:,} Pages", font=("Consolas", 9, "bold"))
         self.lbl_fa_failed_pages.grid(row=1, column=1, sticky="w", padx=4)
 
         ttk.Label(sub_grid, text="Impacted Sectors:").grid(row=1, column=2, sticky="e", padx=4)
-        self.lbl_fa_failed_sectors = ttk.Label(sub_grid, text="0 / 512 Sectors", font=("Consolas", 9, "bold"))
+        self.lbl_fa_failed_sectors = ttk.Label(sub_grid, text=f"0 / {self.n_sectors:,} Sectors", font=("Consolas", 9, "bold"))
         self.lbl_fa_failed_sectors.grid(row=1, column=3, sticky="w", padx=4)
 
         ttk.Label(sub_grid, text="Total Mismatch Bytes:").grid(row=2, column=0, sticky="e", padx=4)
@@ -630,7 +758,7 @@ class FlashProgrammerGUI:
         btn_export.pack(side="right", padx=4)
 
     def record_fail_line(self, line):
-        """ FIX: parse FAIL_ADDR แบบทนทาน + นับจำนวน mismatch จริง (ไม่ hard-code 256)
+        """ parse FAIL_ADDR แบบทนทาน + นับจำนวน mismatch จริง (ไม่ hard-code 256)
             รองรับ  FAIL_ADDR:addr:detail          (นับ +1 ต่อบรรทัด)
                     FAIL_ADDR:addr:count:detail    (ใช้ count จาก firmware) """
         parts = line.split(":", 3)
@@ -654,7 +782,7 @@ class FlashProgrammerGUI:
         self.tested_sectors.add(addr_val // 4096)
         self.fa_unsaved = True
 
-        if page_addr not in self.failed_pages:
+        if page_addr not in self.failed_page_err_counts:
             self.failed_pages.append(page_addr)
             self.failed_page_err_counts[page_addr] = 0
             self.failed_page_samples[page_addr] = f"@{addr_hex} {detail}"
@@ -673,9 +801,13 @@ class FlashProgrammerGUI:
         self.refresh_fail_dropdown()
 
         if not self.failed_pages:
-            self.lbl_fa_status.config(text="STATUS: VERIFICATION PASSED (0 ERRORS DETECTED)", foreground="#34C759")
-            self.lbl_fa_failed_pages.config(text="0 / 8,192 Pages")
-            self.lbl_fa_failed_sectors.config(text="0 / 512 Sectors")
+            # ขึ้น PASSED เฉพาะเมื่อมีการทดสอบเสร็จสมบูรณ์จริง
+            if self.tested_sectors:
+                self.lbl_fa_status.config(text="STATUS: VERIFICATION PASSED (0 ERRORS DETECTED)", foreground="#34C759")
+            else:
+                self.lbl_fa_status.config(text="STATUS: NO COMPLETE RESULT (aborted / not run)", foreground="#FF9500")
+            self.lbl_fa_failed_pages.config(text=f"0 / {self.n_pages:,} Pages")
+            self.lbl_fa_failed_sectors.config(text=f"0 / {self.n_sectors:,} Sectors")
             self.lbl_fa_total_bytes.config(text="0 Bytes")
             self.lbl_fa_defect_rate.config(text="0.00 %", foreground="#34C759")
             return
@@ -683,11 +815,11 @@ class FlashProgrammerGUI:
         total_failed_pages = len(self.failed_pages)
         impacted_sectors_set = set(p // 4096 for p in self.failed_pages)
         total_mismatch_bytes = sum(self.failed_page_err_counts.values())
-        defect_rate = (total_mismatch_bytes / float(CHIP_SIZE)) * 100.0
+        defect_rate = (total_mismatch_bytes / float(self.chip_size)) * 100.0
 
         self.lbl_fa_status.config(text=f"STATUS: VERIFICATION FAILED ({total_failed_pages} FAILING PAGES DETECTED)", foreground="#FF3B30")
-        self.lbl_fa_failed_pages.config(text=f"{total_failed_pages:,} / 8,192 Pages")
-        self.lbl_fa_failed_sectors.config(text=f"{len(impacted_sectors_set):,} / 512 Sectors")
+        self.lbl_fa_failed_pages.config(text=f"{total_failed_pages:,} / {self.n_pages:,} Pages")
+        self.lbl_fa_failed_sectors.config(text=f"{len(impacted_sectors_set):,} / {self.n_sectors:,} Sectors")
         self.lbl_fa_total_bytes.config(text=f"{total_mismatch_bytes:,} Bytes")
         self.lbl_fa_defect_rate.config(text=f"{defect_rate:.4f} %", foreground="#FF3B30")
 
@@ -720,7 +852,7 @@ class FlashProgrammerGUI:
         idx = int(selected[0])
         if 0 <= idx < len(self.failed_pages):
             target_addr = self.failed_pages[idx]
-            self.goto_hex_viewer(target_addr, 256)  # FIX
+            self.goto_hex_viewer(target_addr, 256)
 
     def cmd_export_fa_report(self):
         if not self.failed_pages:
@@ -750,11 +882,11 @@ class FlashProgrammerGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export report: {e}")
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # TAB 3: DEDICATED FLASH BITMAP TAB
-    # -------------------------------------------------------------------------
+    # =========================================================================
     def setup_tab_bitmap(self):
-        header_frame = ttk.LabelFrame(self.tab_bitmap, text=" 🗺️ 512 Sector Flash Memory Block Map (4KB / Sector) ")
+        header_frame = ttk.LabelFrame(self.tab_bitmap, text=" 🗺️ Sector Flash Memory Block Map (4KB / Sector) ")
         header_frame.pack(fill="x", padx=10, pady=5)
 
         info_row = ttk.Frame(header_frame)
@@ -783,7 +915,7 @@ class FlashProgrammerGUI:
         self.lbl_bitmap_selected = ttk.Label(info_row, text="Selected: Sector 0 (0x000000 - 0x000FFF)", font=("Consolas", 9, "bold"), foreground="#007ACC")
         self.lbl_bitmap_selected.pack(side="right", padx=5)
 
-        canvas_frame = ttk.LabelFrame(self.tab_bitmap, text=" Sector Memory Matrix (32 Cols x 16 Rows) ")
+        canvas_frame = ttk.LabelFrame(self.tab_bitmap, text=" Sector Memory Matrix (32 Columns) ")
         canvas_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.bitmap_canvas = tk.Canvas(canvas_frame, bg="#1E1E1E", highlightthickness=0)
@@ -813,14 +945,15 @@ class FlashProgrammerGUI:
         self.bitmap_canvas.delete("all")
         self.bitmap_rects.clear()
 
-        cols, rows = 32, 16
+        cols = 32
+        rows = self.n_sectors // cols
         box_w, box_h = 28, 24
         pad_x, pad_y = 3, 4
         start_x, start_y = 10, 10
 
         impacted_sectors = set(p // 4096 for p in self.failed_pages)
 
-        for sec in range(512):
+        for sec in range(self.n_sectors):
             r = sec // cols
             c = sec % cols
 
@@ -852,6 +985,7 @@ class FlashProgrammerGUI:
 
     def on_bitmap_click(self, event):
         cols = 32
+        rows = self.n_sectors // cols
         box_w, box_h = 28, 24
         pad_x, pad_y = 3, 4
         start_x, start_y = 10, 10
@@ -862,9 +996,9 @@ class FlashProgrammerGUI:
         c = int((click_x - start_x) // (box_w + pad_x))
         r = int((click_y - start_y) // (box_h + pad_y))
 
-        if 0 <= c < cols and 0 <= r < 16:
+        if 0 <= c < cols and 0 <= r < rows:
             sec = r * cols + c
-            if 0 <= sec <= 511:
+            if 0 <= sec < self.n_sectors:
                 self.selected_bitmap_sector = sec
                 start_addr = sec * 4096
                 self.set_active_target(start_addr, 4096)
@@ -895,9 +1029,9 @@ class FlashProgrammerGUI:
         addr = fails[0] if fails else sec * 4096
         self.goto_hex_viewer(addr, 256)
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # TAB 4: DEDICATED HEX VIEWER
-    # -------------------------------------------------------------------------
+    # =========================================================================
     def setup_tab_hex(self):
         nav_frame = ttk.LabelFrame(self.tab_hex, text=" Memory Navigation & Range Controls ")
         nav_frame.pack(fill="x", padx=10, pady=5)
@@ -928,10 +1062,10 @@ class FlashProgrammerGUI:
         self.lbl_hex_page_info.grid(row=0, column=8, padx=10, pady=6)
 
         # แถวที่ 2: Dropdown เลือก page ที่เสีย (ข้าม sector ได้)
-        self._fail_dd_pages = []        # page ที่เสียทั้งหมด (เรียงแล้ว)
-        self._fail_dd_by_sector = {}    # sector -> [page addr ที่เสีย]
-        self._fail_dd_sectors = []      # sector ที่มี page เสีย (เรียงแล้ว)
-        self._fail_dd_cur_sector = None # sector ที่รายการใน dropdown Page แสดงอยู่
+        self._fail_dd_pages = []
+        self._fail_dd_by_sector = {}
+        self._fail_dd_sectors = []
+        self._fail_dd_cur_sector = None
         fail_nav = ttk.Frame(nav_frame)
         fail_nav.grid(row=1, column=0, columnspan=9, sticky="w", padx=5, pady=(0, 6))
         ttk.Label(fail_nav, text="Failing Sector:").pack(side="left", padx=4)
@@ -974,7 +1108,7 @@ class FlashProgrammerGUI:
             self.ent_hex_jump.insert(0, f"0x{self.target_hex_addr:06X}")
 
     def cmd_hex_next_block(self):
-        if self.target_hex_addr + self.bytes_per_hex_view < CHIP_SIZE:
+        if self.target_hex_addr + self.bytes_per_hex_view < self.chip_size:
             self.set_active_target(self.target_hex_addr + self.bytes_per_hex_view)
             self.ent_hex_jump.delete(0, tk.END)
             self.ent_hex_jump.insert(0, f"0x{self.target_hex_addr:06X}")
@@ -1010,7 +1144,6 @@ class FlashProgrammerGUI:
         """ sync dropdown ทั้งสองช่องกับ page ที่กำลังดูอยู่ """
         if not hasattr(self, 'lbl_fail_nav'):
             return
-        import bisect
         pages = self._fail_dd_pages
         if not pages:
             self.fail_sector_cb.set("")
@@ -1081,16 +1214,25 @@ class FlashProgrammerGUI:
             return offset & 0xFF
         return 0xFF
 
+    def is_mismatch_byte(self, abs_addr, b):
+        """ ไฮไลต์เฉพาะ address ที่อยู่ในช่วงที่ verify จริงเท่านั้น """
+        if self.last_verified_pat_type is None or not self.last_verified_range:
+            return False
+        lo, hi = self.last_verified_range
+        if not (lo <= abs_addr < hi):
+            return False
+        return b != self.get_expected_byte(abs_addr, self.last_verified_pat_type, self.last_verified_custom_hex)
+
     def load_hex_view_page(self):
         if not self.check_jedec_requirement():
             return
         try:
             addr = int(self.ent_hex_jump.get().strip(), 16)
             addr = addr & ~0xF
-            if 0 <= addr and addr + self.bytes_per_hex_view <= CHIP_SIZE:
+            if 0 <= addr and addr + self.bytes_per_hex_view <= self.chip_size:
                 self.set_active_target(addr)
             else:
-                messagebox.showerror("Error", "Address/View size out of range (0x000000 - 0x1FFFFF)")
+                messagebox.showerror("Error", f"Address/View size out of range (0x000000 - 0x{self.chip_size - 1:06X})")
                 return
         except ValueError:
             messagebox.showerror("Error", "Invalid Hex Address format")
@@ -1103,12 +1245,16 @@ class FlashProgrammerGUI:
             self.update_phase_status("[ State: IDLE ]")
             return
 
-        raw_hex_list = resp[5:].strip().split(" ")
+        raw_hex_list = resp[5:].strip().split()
         try:
             raw_bytes = bytes([int(x, 16) for x in raw_hex_list])
         except ValueError:
+            self.ops_log("[ERROR] Hex data parse error (invalid DATA line)")
             self.update_phase_status("[ State: IDLE ]")
             return
+
+        if len(raw_bytes) != self.bytes_per_hex_view:
+            self.ops_log(f"[WARN] Expected {self.bytes_per_hex_view} bytes but received {len(raw_bytes)}")
 
         self.txt_hex_display.config(state="normal")
         self.txt_hex_display.delete('1.0', tk.END)
@@ -1125,17 +1271,9 @@ class FlashProgrammerGUI:
 
             for j in range(len(chunk)):
                 b = chunk[j]
-                byte_offset = i + j
-                abs_addr = self.target_hex_addr + byte_offset
-
-                is_mismatch = False
-                if self.last_verified_pat_type is not None:
-                    exp_b = self.get_expected_byte(abs_addr, self.last_verified_pat_type, self.last_verified_custom_hex)
-                    if b != exp_b:
-                        is_mismatch = True
-
+                abs_addr = self.target_hex_addr + i + j
                 hex_str = f"{b:02X}"
-                if is_mismatch:
+                if self.is_mismatch_byte(abs_addr, b):
                     self.txt_hex_display.insert(tk.END, hex_str, "mismatch")
                 else:
                     self.txt_hex_display.insert(tk.END, hex_str)
@@ -1156,14 +1294,7 @@ class FlashProgrammerGUI:
                 b = chunk[j]
                 abs_addr = self.target_hex_addr + i + j
                 char_str = chr(b) if 32 <= b <= 126 else "."
-
-                is_mismatch = False
-                if self.last_verified_pat_type is not None:
-                    exp_b = self.get_expected_byte(abs_addr, self.last_verified_pat_type, self.last_verified_custom_hex)
-                    if b != exp_b:
-                        is_mismatch = True
-
-                if is_mismatch:
+                if self.is_mismatch_byte(abs_addr, b):
                     self.txt_hex_display.insert(tk.END, char_str, "mismatch")
                 else:
                     self.txt_hex_display.insert(tk.END, char_str)
@@ -1173,9 +1304,9 @@ class FlashProgrammerGUI:
         self.txt_hex_display.config(state="disabled")
         self.update_phase_status("[ State: IDLE ]")
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # TAB 5: DEDICATED TARGETED LOOP & STRESS TEST TAB
-    # -------------------------------------------------------------------------
+    # =========================================================================
     def setup_tab_loop(self):
         target_frame = ttk.LabelFrame(self.tab_loop, text=" 🎯 Central Active Target Context ")
         target_frame.pack(fill="x", padx=10, pady=5)
@@ -1329,10 +1460,15 @@ class FlashProgrammerGUI:
             self.ent_loop_max_count.config(state="disabled")
 
     def loop_log(self, text):
-        self.txt_loop_log.config(state="normal")
-        self.txt_loop_log.insert(tk.END, text + "\n")
-        self.txt_loop_log.see(tk.END)
-        self.txt_loop_log.config(state="disabled")
+        if self.closing:  # กัน TclError หลังปิดหน้าต่าง
+            return
+        try:
+            self.txt_loop_log.config(state="normal")
+            self.txt_loop_log.insert(tk.END, text + "\n")
+            self.txt_loop_log.see(tk.END)
+            self.txt_loop_log.config(state="disabled")
+        except tk.TclError:
+            pass
 
     def cmd_clear_loop_log(self):
         self.txt_loop_log.config(state="normal")
@@ -1348,14 +1484,14 @@ class FlashProgrammerGUI:
         self.lbl_stat_fail.config(text="0")
 
     def loop_sleep(self, delay_ms):
-        """ FIX: หน่วงแบบไม่ทำให้ UI ค้าง และกด STOP ติดระหว่างรอ """
+        """ หน่วงแบบไม่ทำให้ UI ค้าง และกด STOP ติดระหว่างรอ """
         end = time.time() + delay_ms / 1000.0
-        while time.time() < end and self.loop_running:
+        while time.time() < end and self.loop_running and not self.closing:
             self.root.update()
             time.sleep(0.01)
 
     def cmd_start_target_loop(self):
-        if self.loop_running:  # FIX: กันกด START ซ้อน
+        if self.loop_running:  # กันกด START ซ้อน
             return
         if not self.check_jedec_requirement():
             return
@@ -1365,16 +1501,8 @@ class FlashProgrammerGUI:
 
         op_mode = self.loop_op_cb.get()
 
-        # อ่านค่าจากช่องกรอกอีกครั้ง กันค่า stale
-        try:
-            self.set_active_target(int(self.ent_loop_addr.get().strip(), 16))
-        except ValueError:
-            messagebox.showerror("Error", "Invalid Hex Address format")
-            return
-        if self.ent_loop_len.get().strip().isdigit():
-            self.target_len = int(self.ent_loop_len.get().strip())
-
-        if not self.validate_target():
+        # อ่าน + validate จากช่องกรอก (ไม่ clamp เงียบๆ)
+        if not self.read_target_entries(self.ent_loop_addr, self.ent_loop_len):
             return
         if ("Write" in op_mode or "Erase" in op_mode) and not self.check_unlocked():
             return
@@ -1389,21 +1517,31 @@ class FlashProgrammerGUI:
         max_count = int(self.ent_loop_max_count.get().strip()) if is_fixed_count and self.ent_loop_max_count.get().strip().isdigit() else 1000
         stop_on_fail = self.stop_on_fail_var.get()
 
-        first_sec = self.target_hex_addr // 4096
-        last_sec = (self.target_hex_addr + self.target_len - 1) // 4096
+        t_addr = self.target_hex_addr
+        t_len = self.target_len
+        first_sec = t_addr // 4096
+        last_sec = (t_addr + t_len - 1) // 4096
+        does_verify = "Verify" in op_mode
 
         self.stop_requested = False
         self.loop_running = True
         self.reset_loop_stats()
 
+        # เริ่ม loop ใหม่ -> ล้างผล FA เก่า ไม่ให้ปนกัน
+        if does_verify:
+            self.clear_fa_data()
+            self.clear_verified()
+
         self.loop_log("==========================================")
         self.loop_log("🚀 STARTING TARGETED STRESS LOOP ENGINE")
         self.loop_log(f"   Active Target: Addr {addr_str} | Len {len_str} Bytes")
         self.loop_log(f"   Op Mode: {op_mode} | Pattern #{pat_idx} (0x{custom_hex})")
+        if "Write" in op_mode and "Erase" not in op_mode:
+            self.loop_log("   ⚠️ Write Pattern ไม่ได้ Erase ก่อน — flash เปลี่ยน 1→0 ได้อย่างเดียว ผลอาจเพี้ยนถ้ายังไม่ได้ลบ")
         self.loop_log("==========================================")
 
         try:
-            while self.loop_running:
+            while self.loop_running and not self.closing:
                 self.loop_current_iter += 1
                 max_str = str(max_count) if is_fixed_count else "∞"
                 self.lbl_stat_iter.config(text=f"{self.loop_current_iter} / {max_str}")
@@ -1413,19 +1551,20 @@ class FlashProgrammerGUI:
                 fail_reason = ""
 
                 if "Verify Pattern" in op_mode:
-                    self.last_verified_pat_type = pat_idx
-                    self.last_verified_custom_hex = custom_hex
+                    self.set_verified(pat_idx, custom_hex, t_addr, t_len)
                     resp = self.execute_cmd_with_progress(f"VERIFY:{addr_str}:{len_str}:{pat_idx}:{custom_hex}", ["VERIFY:OK", "VERIFY:FAIL:"])
                     if resp == "VERIFY:OK":
                         is_pass = True
+                        self.mark_tested(t_addr, t_len)
                     elif resp and resp.startswith("VERIFY:FAIL:"):
+                        self.mark_tested(t_addr, t_len)
                         cnt, where = self.parse_verify_fail(resp)
                         fail_reason = f"VERIFY FAIL ({cnt} errors) @ {where}"
                     else:
-                        fail_reason = "no valid response (timeout/abort)"
+                        fail_reason = "no valid response (timeout/abort/error)"
 
                 elif "Write Pattern" in op_mode:
-                    self.last_verified_pat_type = None
+                    self.clear_verified()
                     resp = self.execute_cmd_with_progress(f"WRITE_PAT:{addr_str}:{len_str}:{pat_idx}:{custom_hex}", ["WRITE_PAT:OK"])
                     if resp == "WRITE_PAT:OK":
                         is_pass = True
@@ -1433,35 +1572,45 @@ class FlashProgrammerGUI:
                         fail_reason = "WRITE failed (no valid response)"
 
                 elif "Erase -> Write -> Verify" in op_mode:
-                    # FIX: ลบให้ครบทุก sector ที่ target คร่อมอยู่ (เดิมลบแค่ sector แรก)
+                    # ลบให้ครบทุก sector ที่ target คร่อมอยู่
                     erase_ok = True
                     for s in range(first_sec, last_sec + 1):
                         if not self.loop_running:
                             erase_ok = False
                             break
                         r = self.execute_cmd_with_progress(f"ERASE:0x{s * 4096:06X}", ["ERASE:OK"])
-                        if r != "ERASE:OK":
+                        # firmware ตอบ "ERASE:OK:0xADDR" -> ต้องใช้ startswith
+                        if not (r and r.startswith("ERASE:OK")):
                             erase_ok = False
                             fail_reason = f"ERASE failed @ sector {s}"
                             break
                     if erase_ok:
-                        self.last_verified_pat_type = None
+                        self.clear_verified()
                         resp_write = self.execute_cmd_with_progress(f"WRITE_PAT:{addr_str}:{len_str}:{pat_idx}:{custom_hex}", ["WRITE_PAT:OK"])
                         if resp_write == "WRITE_PAT:OK":
-                            self.last_verified_pat_type = pat_idx
-                            self.last_verified_custom_hex = custom_hex
+                            self.set_verified(pat_idx, custom_hex, t_addr, t_len)
                             resp_ver = self.execute_cmd_with_progress(f"VERIFY:{addr_str}:{len_str}:{pat_idx}:{custom_hex}", ["VERIFY:OK", "VERIFY:FAIL:"])
                             if resp_ver == "VERIFY:OK":
                                 is_pass = True
+                                self.mark_tested(t_addr, t_len)
                             elif resp_ver and resp_ver.startswith("VERIFY:FAIL:"):
+                                self.mark_tested(t_addr, t_len)
                                 cnt, where = self.parse_verify_fail(resp_ver)
                                 fail_reason = f"ERASE-WRITE-VERIFY FAIL ({cnt} errors) @ {where}"
                             else:
-                                fail_reason = "VERIFY no valid response (timeout/abort)"
+                                fail_reason = "VERIFY no valid response (timeout/abort/error)"
                         else:
                             fail_reason = "WRITE failed (no valid response)"
 
-                # FIX: ผู้ใช้กด STOP -> ไม่นับเป็น Fail
+                if self.closing:
+                    break
+
+                # สาย USB หลุด -> หยุดทันที (ไม่วนต่อ ไม่นับเป็น fail)
+                if not self.is_connected():
+                    self.loop_log(f"🔌 [STOPPED] Serial disconnected during Loop #{self.loop_current_iter}")
+                    break
+
+                # ผู้ใช้กด STOP -> ไม่นับเป็น Fail
                 if not self.loop_running:
                     self.loop_log(f"⛔ [STOPPED] Loop #{self.loop_current_iter} aborted by user")
                     break
@@ -1490,15 +1639,384 @@ class FlashProgrammerGUI:
             if not self.closing:
                 self.update_progress(0)
                 self.update_phase_status("[ State: IDLE ]")
+                # ส่งผลไปแท็บ FA / Bitmap
+                if does_verify:
+                    self.update_fa_table_data()
+                    self.render_bitmap_grid()
+                    if self.failed_pages:
+                        self.notebook.select(self.tab_fa)
 
+    # =========================================================================
+    # TAB 6: DATA I/O  (Dump / Compare / Blank Check)
     # -------------------------------------------------------------------------
+    # ใช้เฉพาะคำสั่งที่ firmware มีอยู่แล้ว:
+    #   READ:0xADDR:LEN                -> DATA:<hex bytes>
+    #   VERIFY / VERIFY_FULL_PAT       -> VERIFY:OK|VERIFY:FAIL:
+    # =========================================================================
+    def setup_tab_io(self):
+        file_frame = ttk.LabelFrame(self.tab_io, text=" 📁 Binary File (.bin) ")
+        file_frame.pack(fill="x", padx=10, pady=5)
+        self.ent_io_file = ttk.Entry(file_frame, width=95)
+        self.ent_io_file.pack(side="left", padx=6, pady=6)
+        ttk.Button(file_frame, text="Browse...", command=self.cmd_io_browse).pack(side="left", padx=4, pady=6)
+
+        rng_frame = ttk.LabelFrame(self.tab_io, text=" 🎯 Range ")
+        rng_frame.pack(fill="x", padx=10, pady=5)
+        r1 = ttk.Frame(rng_frame)
+        r1.pack(fill="x", padx=6, pady=4)
+
+        ttk.Label(r1, text="Address (Hex):").pack(side="left", padx=4)
+        self.ent_io_addr = ttk.Entry(r1, width=12)
+        self.ent_io_addr.insert(0, "0x000000")
+        self.ent_io_addr.pack(side="left", padx=4)
+        self.ent_io_addr.bind("<KeyRelease>", self.on_io_addr_input)
+
+        ttk.Label(r1, text="Length (Bytes):").pack(side="left", padx=(12, 4))
+        self.ent_io_len = ttk.Entry(r1, width=12)
+        self.ent_io_len.insert(0, "4096")
+        self.ent_io_len.pack(side="left", padx=4)
+        self.ent_io_len.bind("<KeyRelease>", self.on_io_len_input)
+
+        self.btn_io_full = ttk.Button(r1, text=f"Full Chip ({self.chip_label})", command=self.cmd_io_full_chip)
+        self.btn_io_full.pack(side="left", padx=8)
+
+        self.lbl_io_sec_page = ttk.Label(r1, text="Sector: 0 (0-511)  |  Page: 0 (0-8191)", font=("Consolas", 9, "bold"), foreground="#007ACC")
+        self.lbl_io_sec_page.pack(side="left", padx=10)
+
+        ttk.Label(rng_frame,
+                  text="💡 Dump / Blank Check ใช้ Address + Length  |  Compare ใช้ Address + ขนาดไฟล์ (ไม่ใช้ Length)",
+                  font=("Segoe UI", 8, "italic"), foreground="#666666").pack(anchor="w", padx=10, pady=(0, 4))
+
+        act_frame = ttk.LabelFrame(self.tab_io, text=" 🚀 Data Operations ")
+        act_frame.pack(fill="x", padx=10, pady=5)
+        a1 = ttk.Frame(act_frame)
+        a1.pack(fill="x", padx=6, pady=6)
+
+        ttk.Button(a1, text="📤 Dump Chip → .bin", command=self.cmd_io_dump).pack(side="left", padx=4)
+        ttk.Button(a1, text="⚖️ Compare File vs Chip", command=self.cmd_io_compare).pack(side="left", padx=4)
+        ttk.Button(a1, text="🧼 Blank Check", command=self.cmd_io_blank_check).pack(side="left", padx=4)
+
+        ttk.Button(a1, text="🧹 Clear Log", command=self.cmd_io_clear_log).pack(side="right", padx=4)
+
+        log_frame = ttk.LabelFrame(self.tab_io, text=" 📜 Data I/O Log ")
+        log_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        self.txt_io_log = scrolledtext.ScrolledText(log_frame, font=("Consolas", 9), state="disabled")
+        self.txt_io_log.pack(fill="both", expand=True, padx=5, pady=5)
+
+    # ---- UI helpers --------------------------------------------------------
+    def io_log(self, text):
+        if self.closing:
+            return
+        try:
+            self.txt_io_log.config(state="normal")
+            self.txt_io_log.insert(tk.END, text + "\n")
+            self.txt_io_log.see(tk.END)
+            self.txt_io_log.config(state="disabled")
+        except tk.TclError:
+            pass
+
+    def cmd_io_clear_log(self):
+        self.txt_io_log.config(state="normal")
+        self.txt_io_log.delete('1.0', tk.END)
+        self.txt_io_log.config(state="disabled")
+
+    def cmd_io_browse(self):
+        path = filedialog.askopenfilename(
+            title="Select binary file",
+            filetypes=[("Binary", "*.bin *.rom *.img"), ("All Files", "*.*")])
+        if path:
+            self.ent_io_file.delete(0, tk.END)
+            self.ent_io_file.insert(0, path)
+
+    def sync_target_to_io_ui(self):
+        self.ent_io_addr.delete(0, tk.END)
+        self.ent_io_addr.insert(0, f"0x{self.target_hex_addr:06X}")
+        self.ent_io_len.delete(0, tk.END)
+        self.ent_io_len.insert(0, str(self.target_len))
+        self.update_target_info_labels()
+
+    def on_io_addr_input(self, event=None):
+        try:
+            self.set_active_target(int(self.ent_io_addr.get().strip(), 16))
+        except ValueError:
+            pass
+
+    def on_io_len_input(self, event=None):
+        val = self.ent_io_len.get().strip()
+        if val.isdigit():
+            self.target_len = int(val)
+            self.update_target_info_labels()
+
+    def cmd_io_full_chip(self):
+        self.set_active_target(0, self.chip_size)
+        self.sync_target_to_io_ui()
+
+    # ---- job control -------------------------------------------------------
+    def io_begin(self):
+        self.job_running = True
+        self.stop_requested = False
+        self.update_progress(0)
+
+    def io_end(self):
+        self.job_running = False
+        if not self.closing:
+            self.update_progress(0)
+            self.update_phase_status("[ State: IDLE ]")
+
+    def io_should_stop(self):
+        """ เรียกระหว่าง chunk: ให้ UI ตอบสนอง (กด STOP ได้) แล้วเช็กว่าควรเลิกหรือไม่ """
+        try:
+            self.root.update()
+        except tk.TclError:
+            return True
+        return self.stop_requested or self.closing or not self.is_connected()
+
+    def io_fail(self, msg):
+        """ แยก 'ผู้ใช้กด STOP' / 'สายหลุด' / 'error จริง' -> (state, message) """
+        if not self.is_connected():
+            return "error", "serial disconnected"
+        if self.stop_requested:
+            return "aborted", ""
+        return "error", msg
+
+    @staticmethod
+    def fmt_eta(sec):
+        sec = int(max(0, sec))
+        return f"{sec // 60}:{sec % 60:02d}"
+
+    def io_progress(self, name, done, total, t0):
+        pct = int(done * 100 / total) if total else 100
+        elapsed = time.time() - t0
+        eta = elapsed * (total - done) / done if done else 0
+        self.update_progress(pct)
+        self.update_phase_status(f"[ {name} {pct}% | ETA {self.fmt_eta(eta)} ]")
+
+    # ---- low-level flash access -------------------------------------------
+    def io_read_block(self, addr, length):
+        resp = self.execute_cmd_with_progress(f"READ:0x{addr:06X}:{length}", ["DATA:"], show_progress=False)
+        if not resp or not resp.startswith("DATA:"):
+            return None
+        try:
+            data = bytes.fromhex(resp[5:].strip())
+        except ValueError:
+            return None
+        return data if len(data) == length else None
+
+    def io_record_mismatches(self, base, expected, actual):
+        """ เทียบ expected/actual แล้วบันทึกเข้า FA (แยกตาม page จริง) คืนจำนวน byte ที่ต่าง """
+        if expected == actual:
+            return 0
+        total = 0
+        n = min(len(expected), len(actual))
+        o = 0
+        while o < n:
+            a0 = base + o
+            seg = min(n - o, ((a0 >> 8) + 1) * 256 - a0)  # ไม่ข้ามขอบ page
+            e = expected[o:o + seg]
+            a = actual[o:o + seg]
+            if e != a:
+                diffs = [i for i in range(seg) if e[i] != a[i]]
+                first = diffs[0]
+                total += len(diffs)
+                self.record_fail_line(f"FAIL_ADDR:{a0 + first:06X}:{len(diffs)}:exp {e[first]:02X} got {a[first]:02X}")
+            o += seg
+        return total
+
+    def io_show_fa_results(self):
+        if self.closing:
+            return
+        self.update_fa_table_data()
+        self.render_bitmap_grid()
+        if self.failed_pages:
+            self.notebook.select(self.tab_fa)
+
+    # ---- 1) DUMP -----------------------------------------------------------
+    def cmd_io_dump(self):
+        if not self.check_jedec_requirement():
+            return
+        if not self.read_target_entries(self.ent_io_addr, self.ent_io_len):
+            return
+        addr, length = self.target_hex_addr, self.target_len
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = filedialog.asksaveasfilename(
+            defaultextension=".bin",
+            initialfile=f"dump_0x{addr:06X}_{length}B_{ts}.bin",
+            filetypes=[("Binary", "*.bin"), ("All Files", "*.*")],
+            title="Save Flash Dump")
+        if not path:
+            return
+
+        tmp = path + ".part"  # เขียนลงไฟล์ชั่วคราวก่อน กันได้ไฟล์ dump ที่ไม่ครบแต่ดูเหมือนสมบูรณ์
+        sha = hashlib.sha256()
+        state, err = "ok", ""
+        t0 = time.time()
+        self.io_log("=" * 42)
+        self.io_log(f"📤 DUMP 0x{addr:06X} - 0x{addr + length - 1:06X} ({length:,} B) -> {os.path.basename(path)}")
+        self.io_begin()
+        try:
+            with open(tmp, "wb") as f:
+                done = 0
+                while done < length:
+                    if self.io_should_stop():
+                        state, err = self.io_fail("stopped")
+                        if state == "ok":
+                            state = "aborted"
+                        break
+                    n = min(IO_READ_CHUNK, length - done)
+                    blk = self.io_read_block(addr + done, n)
+                    if blk is None:
+                        state, err = self.io_fail(f"read failed @ 0x{addr + done:06X}")
+                        break
+                    f.write(blk)
+                    sha.update(blk)
+                    done += n
+                    self.io_progress("DUMP", done, length, t0)
+        except OSError as e:
+            state, err = "error", f"file error: {e}"
+        finally:
+            self.io_end()
+
+        if state == "ok":
+            try:
+                os.replace(tmp, path)
+            except OSError as e:
+                state, err = "error", f"cannot save file: {e}"
+        if state != "ok":
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+        dt = time.time() - t0
+        if state == "ok":
+            self.io_log(f"✅ Dump complete in {dt:.1f}s | SHA-256: {sha.hexdigest()}")
+            if not self.closing:
+                messagebox.showinfo("Dump complete", f"บันทึกแล้ว: {path}\nSHA-256:\n{sha.hexdigest()}")
+        elif state == "aborted":
+            self.io_log("[ABORTED] Dump stopped by user (ไม่ได้บันทึกไฟล์)")
+        else:
+            self.io_log(f"❌ Dump failed: {err}")
+
+    # ---- 2) COMPARE --------------------------------------------------------
+    def cmd_io_compare(self):
+        if not self.check_jedec_requirement():
+            return
+        path = self.ent_io_file.get().strip()
+        if not path:
+            self.cmd_io_browse()
+            path = self.ent_io_file.get().strip()
+            if not path:
+                return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            messagebox.showerror("Error", f"Cannot read file: {e}")
+            return
+        size = len(data)
+        if size == 0:
+            messagebox.showerror("Error", "ไฟล์ว่าง (0 bytes)")
+            return
+        if not self.read_target_entries(self.ent_io_addr, None):
+            return
+        base = self.target_hex_addr
+        if base + size > self.chip_size:
+            messagebox.showerror("Error", f"ไฟล์ {size:,} bytes ที่ 0x{base:06X} เกินขนาด chip ({self.chip_label})")
+            return
+
+        state, err = "ok", ""
+        mismatch_bytes = 0
+        t0 = time.time()
+        self.io_log("=" * 42)
+        self.io_log(f"⚖️ COMPARE {os.path.basename(path)} ({size:,} B) vs chip @ 0x{base:06X}")
+        self.io_begin()
+        self.clear_fa_data()
+        self.clear_verified()
+        try:
+            done = 0
+            while done < size:
+                if self.io_should_stop():
+                    state, err = self.io_fail("stopped")
+                    if state == "ok":
+                        state = "aborted"
+                    break
+                n = min(IO_READ_CHUNK, size - done)
+                blk = self.io_read_block(base + done, n)
+                if blk is None:
+                    state, err = self.io_fail(f"read failed @ 0x{base + done:06X}")
+                    break
+                mismatch_bytes += self.io_record_mismatches(base + done, data[done:done + n], blk)
+                self.mark_tested(base + done, n)
+                done += n
+                self.io_progress("COMPARE", done, size, t0)
+        finally:
+            self.io_end()
+
+        dt = time.time() - t0
+        if state == "ok":
+            if mismatch_bytes:
+                self.io_log(f"🔴 DIFFERENT: {mismatch_bytes:,} mismatched bytes in {len(self.failed_pages)} page(s) "
+                            f"({dt:.1f}s) — ดูแท็บ Failure Analysis")
+            else:
+                self.io_log(f"🟢 IDENTICAL: ไฟล์ตรงกับชิปทุก byte ({dt:.1f}s)")
+        elif state == "aborted":
+            self.io_log("[ABORTED] Compare stopped by user (ผลเป็นเพียงบางส่วน)")
+        else:
+            self.io_log(f"❌ Compare failed: {err}")
+
+        if self.tested_sectors or self.failed_pages:
+            self.io_show_fa_results()
+
+    # ---- 3) BLANK CHECK ----------------------------------------------------
+    def cmd_io_blank_check(self):
+        if not self.check_jedec_requirement():
+            return
+        if not self.read_target_entries(self.ent_io_addr, self.ent_io_len):
+            return
+        addr, length = self.target_hex_addr, self.target_len
+        full = (addr == 0 and length == self.chip_size)
+
+        self.io_log("=" * 42)
+        self.io_log(f"🧼 BLANK CHECK 0x{addr:06X} - 0x{addr + length - 1:06X} ({length:,} B) — expect all 0xFF")
+        self.io_begin()
+        self.clear_fa_data()
+        self.set_verified(0, "FF", addr, length)  # Hex Viewer จะไฮไลต์ byte ที่ไม่ใช่ 0xFF
+        t0 = time.time()
+        try:
+            self.update_phase_status("[ Phase: BLANK CHECK... ]")
+            cmd = "VERIFY_FULL_PAT:0:FF" if full else f"VERIFY:0x{addr:06X}:{length}:0:FF"
+            resp = self.execute_cmd_with_progress(cmd, ["VERIFY:OK", "VERIFY:FAIL:"])
+        finally:
+            self.io_end()
+
+        dt = time.time() - t0
+        if resp == "VERIFY:OK":
+            self.mark_tested(addr, length)
+            self.io_log(f"🟢 BLANK: ทุก byte เป็น 0xFF ({dt:.2f}s)")
+        elif resp and resp.startswith("VERIFY:FAIL:"):
+            self.mark_tested(addr, length)
+            cnt, where = self.parse_verify_fail(resp)
+            self.io_log(f"🔴 NOT BLANK: {cnt} bytes ไม่ใช่ 0xFF — แรกสุดที่ {where} ({dt:.2f}s)")
+        else:
+            self.io_log("❌ Blank check: no valid response (timeout/abort/error)")
+
+        if self.tested_sectors or self.failed_pages:
+            self.io_show_fa_results()
+
+    # =========================================================================
     # SYSTEM OPERATIONS & HANDLERS
-    # -------------------------------------------------------------------------
+    # =========================================================================
     def ops_log(self, text):
-        self.txt_ops_log.config(state="normal")
-        self.txt_ops_log.insert(tk.END, text + "\n")
-        self.txt_ops_log.see(tk.END)
-        self.txt_ops_log.config(state="disabled")
+        if self.closing:
+            return
+        try:
+            self.txt_ops_log.config(state="normal")
+            self.txt_ops_log.insert(tk.END, text + "\n")
+            self.txt_ops_log.see(tk.END)
+            self.txt_ops_log.config(state="disabled")
+        except tk.TclError:
+            pass
 
     def cmd_clear_log(self):
         self.txt_ops_log.config(state="normal")
@@ -1513,7 +2031,7 @@ class FlashProgrammerGUI:
 
     def on_freq_changed(self, event=None):
         if self.is_connected():
-            if self.busy or self.loop_running:
+            if self.busy or self.loop_running or self.job_running:
                 self.ops_log("[SYSTEM] ⚠️ Cannot change SPI frequency while an operation is running.")
                 return
             freq_str = self.freq_cb.get().split(" ")[0]
@@ -1523,6 +2041,9 @@ class FlashProgrammerGUI:
 
     def toggle_connection(self):
         if self.is_connected():
+            if self.busy or self.job_running:
+                messagebox.showwarning("Busy", "มีงานกำลังทำงานอยู่ กรุณากด STOP ก่อนตัดการเชื่อมต่อ")
+                return
             self.stop_requested = True
             self.loop_running = False
             try:
@@ -1537,7 +2058,7 @@ class FlashProgrammerGUI:
                 messagebox.showerror("Error", "No COM Port selected!")
                 return
             try:
-                # FIX: ตั้ง DTR/RTS ก่อนเปิดพอร์ต เพื่อไม่ให้ ESP32 ถูก reset ตอนเปิด
+                # ตั้ง DTR/RTS ก่อนเปิดพอร์ต เพื่อไม่ให้ ESP32 ถูก reset ตอนเปิด
                 self.ser = serial.Serial()
                 self.ser.port = port
                 self.ser.baudrate = 921600
@@ -1562,21 +2083,24 @@ class FlashProgrammerGUI:
         except Exception:
             return None
 
-    def execute_cmd_with_progress(self, command, expected_end_tokens, timeout=60.0):
+    def execute_cmd_with_progress(self, command, expected_end_tokens, timeout=60.0, show_progress=True):
+        """ timeout เป็น idle timeout: นับจากบรรทัดล่าสุดที่ได้รับ (PROGRESS ที่ส่งมาเรื่อยๆ ถือว่ายังไม่ค้าง) """
         if not self.is_connected():
             messagebox.showwarning("Warning", "Please connect to COM Port first!")
             return None
-        if self.busy:  # FIX: กันคำสั่งซ้อน
+        if self.busy:
             self.ops_log("[WARN] Another command is still running.")
             return None
 
         self.busy = True
         self.stop_requested = False
-        self.update_progress(0)
+        if show_progress:
+            self.update_progress(0)
 
         ser = self.ser
         old_timeout = ser.timeout
         final_resp = None
+        buf = bytearray()  # สะสมข้อมูลจนครบบรรทัด
         try:
             ser.reset_input_buffer()
             ser.write((command + "\n").encode('utf-8'))
@@ -1595,18 +2119,26 @@ class FlashProgrammerGUI:
                     break
 
                 if time.time() - start_time > timeout:
-                    self.ops_log("[ERROR] Operation timed out!")
+                    self.ops_log("[ERROR] Operation timed out (no data from ESP32)! Sending STOP...")
+                    try:
+                        ser.write(b"STOP\n")  # สั่ง ESP32 หยุดด้วย ไม่ปล่อยให้ค้างทำงานต่อ
+                    except Exception:
+                        pass
+                    self.drain_after_stop()
                     break
 
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                line = self.read_line(ser, buf)
                 if not line:
                     continue
+                start_time = time.time()  # มีข้อมูลเข้า = ยังไม่ค้าง (idle timeout)
 
                 if line.startswith("PROGRESS:"):
+                    if not show_progress:
+                        continue
                     try:
                         pct = int(line.split(":")[1])
                         self.update_progress(pct)
-                    except ValueError:
+                    except (ValueError, IndexError):
                         pass
                 elif line.startswith("FAIL_ADDR:"):
                     self.record_fail_line(line)
@@ -1614,6 +2146,10 @@ class FlashProgrammerGUI:
                     self.ops_log("[ABORTED] Hardware operation canceled.")
                     self.update_progress(0)
                     self.update_phase_status("[ State: IDLE ]")
+                    break
+                elif line.startswith("ERR"):
+                    # firmware ตอบ error -> เลิกรอทันที ไม่รอจน timeout
+                    self.ops_log(f"[FIRMWARE ERROR] {line}")
                     break
                 else:
                     for token in expected_end_tokens:
@@ -1625,9 +2161,8 @@ class FlashProgrammerGUI:
 
             return final_resp
         except Exception as e:
-            if not self.closing:
-                self.ops_log(f"[ERROR] Communication failure: {e}")
-                self.set_led_status(False)
+            # สาย USB หลุด / พอร์ตพัง -> หยุด loop + ปิดพอร์ต + เคลียร์ self.ser
+            self.handle_disconnect(e)
             return None
         finally:
             self.busy = False
@@ -1637,7 +2172,7 @@ class FlashProgrammerGUI:
                 pass
 
     def get_custom_hex_val(self):
-        return self.normalize_hex_byte(self.ent_custom_hex.get(), "00")
+        return self.normalize_hex_byte(self.ent_custom_hex.get(), "AA")
 
     def run_all_pattern_sweep_engine(self):
         if not self.check_jedec_requirement():
@@ -1653,19 +2188,21 @@ class FlashProgrammerGUI:
         self.busy = True
 
         self.clear_fa_data()
-        self.last_verified_pat_type = None
+        self.clear_verified()
+        sweep_custom = SWEEP_CUSTOM_HEX  # firmware ฮาร์ดโค้ด pattern 4 = 0xA5
 
         self.ops_log("\n==========================================")
-        self.ops_log("🚀 STARTING ALL-PATTERN FULL-CHIP SWEEP")
+        self.ops_log(f"🚀 STARTING ALL-PATTERN FULL-CHIP SWEEP ({self.chip_label})")
         self.ops_log("==========================================")
 
         ser = self.ser
         old_timeout = ser.timeout
+        buf = bytearray()
         try:
             ser.reset_input_buffer()
             ser.write(f"ALL_PAT_START:{is_loop}\n".encode('utf-8'))
 
-            pat_names = ["0xFF", "0x00", "0xAA", "0x55", "Custom", "Pseudo-Random", "Alt 0xAA/0x55", "Inc (0x00-0xFF)"]
+            pat_names = ["0xFF", "0x00", "0xAA", "0x55", f"Custom (0x{sweep_custom})", "Pseudo-Random", "Alt 0xAA/0x55", "Inc (0x00-0xFF)"]
             curr_cycle = 1
             curr_pat = 0
             curr_phase = "START"
@@ -1674,7 +2211,7 @@ class FlashProgrammerGUI:
 
             while not self.stop_requested:
                 self.root.update()
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                line = self.read_line(ser, buf)
                 if not line:
                     continue
 
@@ -1684,7 +2221,7 @@ class FlashProgrammerGUI:
 
                 elif line.startswith("PAT_START:"):
                     curr_pat = int(line.split(":")[1])
-                    self.last_verified_pat_type = curr_pat
+                    self.set_verified(curr_pat, sweep_custom, 0, self.chip_size)
                     p_name = pat_names[curr_pat] if curr_pat < len(pat_names) else f"#{curr_pat}"
                     self.ops_log(f"  ▶ Pattern #{curr_pat} ({p_name})...")
                     self.update_phase_status(f"[ Cycle #{curr_cycle} | Pat: #{curr_pat} ]")
@@ -1698,7 +2235,7 @@ class FlashProgrammerGUI:
                     try:
                         pct = int(line.split(":")[1])
                         self.update_progress(pct)
-                    except ValueError:
+                    except (ValueError, IndexError):
                         pass
 
                 elif line.startswith("FAIL_ADDR:"):
@@ -1713,19 +2250,22 @@ class FlashProgrammerGUI:
                 elif line.startswith("SWEEP_CYCLE_DONE:"):
                     c_num = line.split(":")[1]
                     self.ops_log(f"✅ Sweep Cycle #{c_num} Completed!")
-                    self.tested_sectors.update(range(512))  # FIX: ทั้งชิปถูกทดสอบแล้ว
+                    self.tested_sectors.update(range(self.n_sectors))  # ทั้งชิปถูกทดสอบแล้ว
                     break
 
                 elif line == "ABORTED":
                     self.ops_log("[ABORTED] Sweep operation canceled by user.")
                     break
 
+                elif line.startswith("ERR"):
+                    self.ops_log(f"[FIRMWARE ERROR] {line}")
+                    break
+
             if self.stop_requested:
                 self.ops_log("[ABORTED] Sweep operation stopped by user.")
-                self.drain_after_stop()  # FIX
+                self.drain_after_stop()
         except Exception as e:
-            if not self.closing:
-                self.ops_log(f"[ERROR] Sweep communication failure: {e}")
+            self.handle_disconnect(e)
         finally:
             self.busy = False
             try:
@@ -1748,12 +2288,12 @@ class FlashProgrammerGUI:
             return
         if not self.check_unlocked():
             return
-        if messagebox.askyesno("Confirm Chip Erase", "Are you sure you want to erase the ENTIRE CHIP (2MB)?"):
+        if messagebox.askyesno("Confirm Chip Erase", f"Are you sure you want to erase the ENTIRE CHIP ({self.chip_label})?"):
             self.update_phase_status("[ Phase: ERASING CHIP... ]")
-            self.ops_log("[ACTION] Erasing ENTIRE CHIP (2 Megabytes)... Please wait...")
+            self.ops_log(f"[ACTION] Erasing ENTIRE CHIP ({self.chip_label})... Please wait...")
             resp = self.execute_cmd_with_progress("ERASE_CHIP", ["ERASE_CHIP:OK"])
             if resp == "ERASE_CHIP:OK":
-                self.last_verified_pat_type = None
+                self.clear_verified()
                 self.ops_log("[SUCCESS] 💥 Entire Chip Erased Successfully!")
             self.update_phase_status("[ State: IDLE ]")
 
@@ -1763,35 +2303,36 @@ class FlashProgrammerGUI:
 
         mode = self.op_mode_cb.get()
         scope = self.scope_cb.get()
+        is_entire = "Entire" in scope
 
         if "Sweep" in mode:
             self.run_all_pattern_sweep_engine()
             return
 
-        # FIX: อ่านค่าจากช่องกรอกอีกครั้งกัน target ไม่ตรงกับที่โชว์
-        if scope != "Entire Chip (2MB)":
-            try:
-                self.set_active_target(int(self.ent_addr.get().strip(), 16))
-            except ValueError:
-                messagebox.showerror("Error", "Invalid Hex Address format")
+        # อ่าน + validate จากช่องกรอกก่อนสั่งงาน (Erase Sector ใช้เฉพาะ address)
+        if "Erase Sector" in mode:
+            if not self.read_target_entries(self.ent_addr, None):
                 return
-            if self.ent_len.get().strip().isdigit():
-                self.target_len = int(self.ent_len.get().strip())
+        elif not is_entire:
+            if not self.read_target_entries(self.ent_addr, self.ent_len):
+                return
 
-        addr = f"0x{self.target_hex_addr:06X}"
-        length = str(self.target_len)
+        # เก็บค่า target เป็นตัวแปร local (ระหว่างรอ root.update() ผู้ใช้อาจแก้ช่องกรอกได้)
+        t_addr = self.target_hex_addr
+        t_len = self.target_len
+        addr = f"0x{t_addr:06X}"
+        length = str(t_len)
         pat_idx = int(self.pat_cb.get().split(":")[0])
         custom_hex = self.get_custom_hex_val()
 
         if "Write Pattern" in mode:
-            if scope != "Entire Chip (2MB)" and not self.validate_target():
-                return
             if not self.check_unlocked():
                 return
             self.update_phase_status("[ Phase: WRITING... ]")
-            self.last_verified_pat_type = None  # ข้อมูลเปลี่ยนแล้ว ไม่ให้ Hex Viewer ไฮไลต์ตาม pattern เก่า
-            if scope == "Entire Chip (2MB)":
-                self.ops_log(f"[ACTION] Writing Pattern #{pat_idx} to ENTIRE CHIP (2MB)...")
+            self.clear_verified()  # ข้อมูลเปลี่ยนแล้ว ไม่ให้ Hex Viewer ไฮไลต์ตาม pattern เก่า
+            self.ops_log("[NOTE] ⚠️ Write Pattern ไม่ได้ Erase ก่อน — flash เปลี่ยน 1→0 ได้อย่างเดียว ถ้ายังไม่ลบ ผลอาจเพี้ยน")
+            if is_entire:
+                self.ops_log(f"[ACTION] Writing Pattern #{pat_idx} to ENTIRE CHIP ({self.chip_label})...")
                 t0 = time.time()
                 resp = self.execute_cmd_with_progress(f"WRITE_FULL_PAT:{pat_idx}:{custom_hex}", ["WRITE_PAT:OK"])
                 t1 = time.time()
@@ -1807,14 +2348,11 @@ class FlashProgrammerGUI:
             self.update_phase_status("[ State: IDLE ]")
 
         elif "Verify Pattern" in mode:
-            if scope != "Entire Chip (2MB)" and not self.validate_target():
-                return
             self.update_phase_status("[ Phase: VERIFYING... ]")
             self.clear_fa_data()
-            self.last_verified_pat_type = pat_idx
-            self.last_verified_custom_hex = custom_hex
 
-            if scope == "Entire Chip (2MB)":
+            if is_entire:
+                self.set_verified(pat_idx, custom_hex, 0, self.chip_size)
                 self.ops_log(f"[ACTION] Verifying ENTIRE CHIP with Pattern #{pat_idx}...")
                 t0 = time.time()
                 resp = self.execute_cmd_with_progress(f"VERIFY_FULL_PAT:{pat_idx}:{custom_hex}", ["VERIFY:OK", "VERIFY:FAIL:"])
@@ -1825,17 +2363,15 @@ class FlashProgrammerGUI:
                     cnt, where = self.parse_verify_fail(resp)
                     self.ops_log(f"[FAILED] 🔴 Full Chip Verification FAILED! ({cnt} errors). First Mismatch @ {where}")
                 if resp and (resp == "VERIFY:OK" or resp.startswith("VERIFY:FAIL:")):
-                    self.tested_sectors.update(range(512))  # FIX: ทั้ง OK และ FAIL ถือว่าทดสอบทั้งชิปแล้ว
+                    self.tested_sectors.update(range(self.n_sectors))  # ทั้ง OK และ FAIL ถือว่าทดสอบทั้งชิปแล้ว
             else:
+                self.set_verified(pat_idx, custom_hex, t_addr, t_len)
                 self.ops_log(f"[ACTION] Verifying Pattern #{pat_idx} at {addr} (Len: {length} bytes)...")
                 t0 = time.time()
                 resp = self.execute_cmd_with_progress(f"VERIFY:{addr}:{length}:{pat_idx}:{custom_hex}", ["VERIFY:OK", "VERIFY:FAIL:"])
                 t1 = time.time()
                 if resp and (resp == "VERIFY:OK" or resp.startswith("VERIFY:FAIL:")):
-                    sec_start = self.target_hex_addr // 4096
-                    sec_end = (self.target_hex_addr + self.target_len - 1) // 4096
-                    for s in range(sec_start, sec_end + 1):
-                        self.tested_sectors.add(s)
+                    self.mark_tested(t_addr, t_len)
 
                 if resp == "VERIFY:OK":
                     self.ops_log(f"[PASSED] 🟢 Verification PASSED (0 Errors) in {t1 - t0:.3f}s!")
@@ -1854,16 +2390,16 @@ class FlashProgrammerGUI:
             if not self.check_unlocked():
                 return
             self.update_phase_status("[ Phase: ERASING... ]")
-            sec_addr = f"0x{(self.target_hex_addr & ~0xFFF):06X}"
+            sec_addr = f"0x{(t_addr & ~0xFFF):06X}"
             self.ops_log(f"[ACTION] Erasing Sector at {sec_addr}...")
             resp = self.execute_cmd_with_progress(f"ERASE:{sec_addr}", ["ERASE:OK"])
-            if resp == "ERASE:OK":
-                self.last_verified_pat_type = None
+            # firmware ตอบ "ERASE:OK:0xADDR" -> ต้องใช้ startswith
+            if resp and resp.startswith("ERASE:OK"):
+                self.clear_verified()
                 self.ops_log(f"[SUCCESS] Sector {sec_addr} Erased.")
             self.update_phase_status("[ State: IDLE ]")
 
     def cmd_read_id(self):
-        # FIX: เดิมถ้ายังไม่ต่อพอร์ตจะเด้ง dialog สองอัน
         if not self.is_connected():
             messagebox.showwarning("Warning", "Please connect to COM Port first!")
             return
@@ -1872,18 +2408,24 @@ class FlashProgrammerGUI:
         resp = self.execute_cmd_with_progress("READ_ID", ["ID:"])
         if resp and resp.startswith("ID:"):
             id_str = resp[3:].strip()
-            dev_name = JEDEC_DB.get(id_str, "Unknown / Unsupported Flash IC")
             self.lbl_jedec.config(text=f"JEDEC ID: {id_str}")
-            self.lbl_device.config(text=f"Device: {dev_name}", foreground="#444444")
-            if id_str in ["00 00 00", "FF FF FF"]:
+            dev_name = JEDEC_DB.get(id_str)
+            if dev_name is None:
                 self.jedec_read_valid = False
-                messagebox.showwarning("Warning", f"อ่านได้ค่า JEDEC ID ({id_str}) ซึ่งไม่ถูกต้อง กรุณาเช็กการเชื่อมต่อสาย IC!")
-            else:
-                self.jedec_read_valid = True
-                self.ops_log(f"[SYSTEM] ✅ Check JEDEC ID Validated: {id_str} ({dev_name})")
+                self.lbl_device.config(text="Device: Unknown / Unsupported (รองรับเฉพาะ SST26VF)", foreground="#FF3B30")
+                if id_str in ("00 00 00", "FF FF FF"):
+                    messagebox.showwarning("Warning", f"อ่านได้ค่า JEDEC ID ({id_str}) ซึ่งไม่ถูกต้อง กรุณาเช็กการเชื่อมต่อสาย IC!")
+                else:
+                    messagebox.showwarning("Warning", f"JEDEC ID {id_str} ไม่ใช่ SST26VF ที่เครื่องมือนี้รองรับ")
+                return
+            self.lbl_device.config(text=f"Device: {dev_name}", foreground="#444444")
+            self.jedec_read_valid = True
+            self.apply_chip_size(CHIP_BY_CAP[int(id_str.split()[2], 16)])
+            self.ops_log(f"[SYSTEM] ✅ Check JEDEC ID Validated: {id_str} ({dev_name})")
         else:
             self.jedec_read_valid = False
-            messagebox.showerror("Error", "Failed to read JEDEC ID")
+            if self.is_connected():  # ถ้าหลุดการเชื่อมต่อ handle_disconnect แจ้งไปแล้ว
+                messagebox.showerror("Error", "Failed to read JEDEC ID")
 
     def cmd_unlock(self):
         if not self.check_jedec_requirement():
@@ -1894,20 +2436,22 @@ class FlashProgrammerGUI:
             self.update_lock_ui(True)
             self.cmd_read_regs()
         else:
-            messagebox.showerror("Error", "Unlock failed")
+            if self.is_connected():
+                messagebox.showerror("Error", "Unlock failed (ดู Operation Log สำหรับรายละเอียดจาก firmware)")
             self.update_lock_ui(False)
 
     def cmd_read_regs(self):
         if not self.check_jedec_requirement():
             return
         resp = self.execute_cmd_with_progress("READ_REGS", ["REGS:"])
-        if resp and resp.startswith("REGS:"):
-            parts = resp.split(":")
+        parts = resp.split(":") if resp else []
+        if resp and resp.startswith("REGS:") and len(parts) >= 3:  # กัน IndexError
             stat_hex, cfg_hex = parts[1], parts[2]
             self.lbl_stat_reg.config(text=f"SR(0x05): 0x{stat_hex}")
             self.lbl_cfg_reg.config(text=f"CR(0x35): 0x{cfg_hex}")
         else:
-            messagebox.showerror("Error", "Failed to read registers")
+            if self.is_connected():
+                messagebox.showerror("Error", "Failed to read registers")
 
 
 if __name__ == "__main__":
